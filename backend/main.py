@@ -1,18 +1,26 @@
 import os
 import json
+import hashlib
+import hmac
 import requests
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+import chromadb
 from datetime import datetime, timezone
 from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 from agent import run_scan
+import ast
+import re
+import shutil
+import tempfile
+import subprocess
+import threading
+from pydriller import Repository as PyDrillerRepo
 
 # Load environment variables
 load_dotenv()
@@ -33,12 +41,16 @@ app.add_middleware(
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+CHROMA_URL = os.getenv("CHROMA_URL", "http://localhost:8000")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 GITHUB_API_BASE = "https://api.github.com"
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
+
+# Global states for tracking in-progress ingestions
+INGESTION_STATUSES = {}
 
 
 def github_get(path: str, params: Optional[dict] = None):
@@ -62,6 +74,192 @@ def github_get(path: str, params: Optional[dict] = None):
         return None
     response.raise_for_status()
     return response.json()
+
+
+def github_graphql(query: str, variables: Optional[dict] = None) -> Optional[dict]:
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        response = requests.post(
+            "https://api.github.com/graphql",
+            headers={
+                "Authorization": f"bearer {GITHUB_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "variables": variables or {}},
+            timeout=15,
+        )
+        if response.status_code == 200:
+            return response.json()
+        print(f"GraphQL request failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Error calling GitHub GraphQL API: {e}")
+    return None
+
+
+def parse_code_structure(repo_dir: Path) -> dict:
+    """Scan all source files in the cloned repository and extract classes, functions, and import details."""
+    structure = {
+        "files": [],
+        "classes": [],
+        "functions": [],
+        "imports": [],
+        "dependencies": [],
+        "documents": [],
+        "relationships": []
+    }
+    
+    for path in repo_dir.rglob("*"):
+        try:
+            if path.is_file():
+                # Skip build/dependency directories to speed up parsing
+                if any(ignored in path.parts for ignored in (".git", "node_modules", ".venv", "venv", "__pycache__", "build", "dist")):
+                    continue
+                
+                rel_path = str(path.relative_to(repo_dir)).replace("\\", "/")
+                ext = path.suffix.lower().replace(".", "")
+                
+                # We cover common codebase extensions
+                if ext not in ("py", "js", "ts", "tsx", "jsx", "java", "go", "rs", "cpp", "h", "cs", "md", "json", "txt", "toml", "xml"):
+                    continue
+                    
+                file_id = f"{rel_path}"
+                structure["files"].append({
+                    "id": file_id,
+                    "path": rel_path,
+                    "name": path.name,
+                    "extension": ext,
+                    "folder": str(Path(rel_path).parent).replace("\\", "/"),
+                    "size_bytes": path.stat().st_size
+                })
+
+                if ext == "md":
+                    structure["documents"].append({
+                        "id": file_id,
+                        "path": rel_path,
+                        "title": path.stem,
+                        "kind": "readme" if path.name.lower() == "readme.md" else "markdown",
+                        "content": path.read_text(encoding="utf-8", errors="ignore")[:50000]
+                    })
+                
+                # Python AST parsing
+                if ext == "py":
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="ignore")
+                        for imported in re.findall(r"(?m)^\s*(?:import|from)\s+([A-Za-z0-9_\.]+)", content):
+                            structure["imports"].append({"file_id": file_id, "name": imported})
+                        tree = ast.parse(content)
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.ClassDef):
+                                class_id = f"{rel_path}::{node.name}"
+                                structure["classes"].append({
+                                    "id": class_id,
+                                    "name": node.name,
+                                    "file_id": file_id
+                                })
+                                structure["relationships"].append((file_id, "DEFINES", class_id))
+                            elif isinstance(node, ast.FunctionDef):
+                                func_id = f"{rel_path}::{node.name}"
+                                structure["functions"].append({
+                                    "id": func_id,
+                                    "name": node.name,
+                                    "file_id": file_id
+                                })
+                                structure["relationships"].append((file_id, "DEFINES", func_id))
+                    except Exception as ast_err:
+                        print(f"Error doing AST parse on {rel_path}: {ast_err}")
+                
+                # Regex parsing for JS/TS/Java/Cpp/Rust/Go/C#
+                elif ext in ("js", "ts", "tsx", "jsx", "java", "rs", "go", "cpp", "cs"):
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="ignore")
+                        for imported in re.findall(r"(?m)^\s*import\s+(?:[^\"']+from\s+)?[\"']([^\"']+)[\"']", content):
+                            structure["imports"].append({"file_id": file_id, "name": imported})
+                        # Match classes
+                        classes = re.findall(r"\bclass\s+([A-Za-z0-9_]+)", content)
+                        for cls_name in classes:
+                            class_id = f"{rel_path}::{cls_name}"
+                            structure["classes"].append({
+                                "id": class_id,
+                                "name": cls_name,
+                                "file_id": file_id
+                            })
+                            structure["relationships"].append((file_id, "DEFINES", class_id))
+                        
+                        # Match functions/methods
+                        functions = re.findall(r"\b(?:function|fn|def)\s+([A-Za-z0-9_]+)", content)
+                        methods = re.findall(r"\b([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{", content)
+                        all_funcs = list(set(functions + methods))
+                        for f_name in all_funcs:
+                            if f_name in ("if", "for", "while", "switch", "catch", "return", "class", "function", "export", "import"):
+                                continue
+                            func_id = f"{rel_path}::{f_name}"
+                            structure["functions"].append({
+                                "id": func_id,
+                                "name": f_name,
+                                "file_id": file_id
+                            })
+                            structure["relationships"].append((file_id, "DEFINES", func_id))
+                    except Exception as rex_err:
+                        print(f"Error parsing structural regex on {rel_path}: {rex_err}")
+                if path.name.lower() in ("package.json", "requirements.txt", "pyproject.toml", "pom.xml", "go.mod", "cargo.toml"):
+                    structure["dependencies"].append({
+                        "file_id": file_id,
+                        "name": path.name,
+                        "content": path.read_text(encoding="utf-8", errors="ignore")[:50000]
+                    })
+        except Exception as file_err:
+            print(f"Skipping {path} due to error: {file_err}")
+            
+    return structure
+
+
+def parse_wiki_documents(wiki_dir: Path, repo_id: str) -> list[dict]:
+    documents = []
+    if not wiki_dir.exists():
+        return documents
+    for path in wiki_dir.rglob("*.md"):
+        if ".git" in path.parts:
+            continue
+        rel_path = str(path.relative_to(wiki_dir)).replace("\\", "/")
+        documents.append({
+            "id": f"wiki/{rel_path}",
+            "path": f"wiki/{rel_path}",
+            "title": path.stem,
+            "kind": "wiki",
+            "content": path.read_text(encoding="utf-8", errors="ignore")[:50000],
+            "url": f"https://github.com/{repo_id}/wiki/{path.stem}"
+        })
+    return documents
+
+
+def mine_commits_locally(repo_dir: Path) -> list:
+    commits_data = []
+    try:
+        for commit in PyDrillerRepo(str(repo_dir)).traverse_commits():
+            files_modified = []
+            for mf in commit.modified_files:
+                files_modified.append({
+                    "filename": mf.filename or "",
+                    "filepath": mf.new_path or mf.old_path or "",
+                    "added": mf.added_lines,
+                    "deleted": mf.deleted_lines,
+                    "diff": mf.diff or ""
+                })
+            commit_time = commit.author_date.isoformat() if commit.author_date else ""
+            commits_data.append({
+                "sha": commit.hash,
+                "message": commit.msg,
+                "author": commit.author.name or "unknown",
+                "date": commit_time,
+                "additions": commit.insertions,
+                "deletions": commit.deletions,
+                "parents": commit.parents,
+                "files": files_modified
+            })
+    except Exception as e:
+        print(f"Error mining commits locally with PyDriller: {e}")
+    return commits_data
 
 
 def github_repo_response(repo: dict) -> dict:
@@ -107,7 +305,10 @@ def scheduled_scan_job():
             print(f"[scheduled scan] Scanning issues for repo: {repo_slug}")
             issues = json.loads(issues_path.read_text(encoding="utf-8"))
             issues = [i for i in issues if i.get("type") == "issue"]
-            data = run_repo_scan(repo_slug, repo_slug, issues)
+            repo_id = issues[0].get("repo", repo_slug) if issues else repo_slug
+            data = run_repo_scan(repo_slug, repo_id, issues)
+            from orchestrator import start_monitoring
+            start_monitoring(repo_id)
             print(f"[scheduled scan] Completed scan for {repo_slug}: {data['scanned']} issues investigated. Saved to {repo_slug}_agent_results.json")
         except Exception as e:
             print(f"[scheduled scan] Error scanning {issues_path.name}: {e}")
@@ -144,16 +345,72 @@ except Exception as e:
     print(f"\nWARNING: Could not load sentence-transformers ({e}).")
     print("Falling back to Neo4j Database Keyword Search Mode.\n")
 
-qdrant_client = None
+chroma_client = None
 
-def get_qdrant_client():
-    global qdrant_client
-    if qdrant_client is None and HAS_EMBEDDINGS:
+def get_chroma_client():
+    global chroma_client
+    if chroma_client is None and HAS_EMBEDDINGS:
+        chroma_url = os.getenv("CHROMA_URL", "http://localhost:8000")
+        from urllib.parse import urlparse
+        parsed = urlparse(chroma_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 8000
+        
+        # Avoid connecting to own FastAPI app
+        if host in ("localhost", "127.0.0.1") and port == 8000:
+            try:
+                data_dir = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Bypassing localhost:8000 port conflict. Using local persistent Chroma client at {data_dir}...")
+                chroma_client = chromadb.PersistentClient(path=str(data_dir))
+            except Exception as ex:
+                print(f"Chroma local initialization failed: {ex}")
+            return chroma_client
+
         try:
-            qdrant_client = QdrantClient(url=QDRANT_URL)
+            client = chromadb.HttpClient(host=host, port=int(port))
+            client.heartbeat()
+            chroma_client = client
         except Exception as e:
-            print(f"Warning: Could not connect to Qdrant at {QDRANT_URL}: {e}")
-    return qdrant_client
+            print(f"Warning: Could not connect to Chroma at {chroma_url}: {e}")
+            try:
+                data_dir = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
+                data_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Falling back to local persistent Chroma client at {data_dir}...")
+                chroma_client = chromadb.PersistentClient(path=str(data_dir))
+            except Exception as ex:
+                print(f"Chroma fallback failed: {ex}")
+    return chroma_client
+
+
+def get_chroma_sync_timestamps(repo_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Return the latest commit date and issue/PR update time stored in Chroma."""
+    chroma = get_chroma_client()
+    if not chroma:
+        return None, None
+
+    try:
+        collection = chroma.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}
+        )
+        stored = collection.get(where={"repo": repo_id}, include=["metadatas"])
+        commit_dates = []
+        issue_updates = []
+        for metadata in stored.get("metadatas") or []:
+            if not metadata:
+                continue
+            source_type = metadata.get("type", "commit")
+            date_value = metadata.get("date") or ""
+            updated_value = metadata.get("updated_at") or date_value
+            if source_type == "commit" and date_value:
+                commit_dates.append(date_value)
+            elif source_type in ("issue", "pull_request", "pr") and updated_value:
+                issue_updates.append(updated_value)
+        return max(commit_dates, default=None), max(issue_updates, default=None)
+    except Exception as e:
+        print(f"Failed to fetch sync timestamps from Chroma: {e}")
+        return None, None
 
 def get_neo4j_driver():
     if not NEO4J_PASSWORD:
@@ -170,6 +427,9 @@ def get_neo4j_driver():
 class QueryRequest(BaseModel):
     repoId: str
     question: str
+
+class IngestRequest(BaseModel):
+    repoUrl: str
 
 class Citation(BaseModel):
     id: str
@@ -217,124 +477,18 @@ class FeedbackRequest(BaseModel):
     decision: str
     correct: bool
     correctedDecision: Optional[str] = None
+    action: Optional[str] = None
+    note: Optional[str] = None
+
+class FollowUpRequest(BaseModel):
+    repoId: str
+    issueNumber: str
+    execute: bool = False
 
 # Mock Data
-MOCK_REPOS = [
-    {
-        "id": "auth-service",
-        "name": "auth-service",
-        "description": "Identity, sessions and token issuance for the platform.",
-        "language": "TypeScript",
-        "decisions": 218,
-    },
-    {
-        "id": "minihooked",
-        "name": "MiniHooked",
-        "description": "Lightweight React hooks toolkit used across product teams.",
-        "language": "TypeScript",
-        "decisions": 94,
-    },
-    {
-        "id": "casesense",
-        "name": "CaseSense",
-        "description": "Case-management engine with a rules DSL and audit trail.",
-        "language": "Python",
-        "decisions": 341,
-    },
-]
-
-MOCK_ANSWERS = [
-    {
-        "question": "Why was OAuth chosen over JWT in the auth module?",
-        "answer": "OAuth 2.0 was adopted as the authorization framework in Q2 2024 after the team hit revocation limits with self-issued JWTs. The discussion in PR #142 concluded that stateless JWTs made instant session revocation impossible without a deny-list, which would have reintroduced a shared datastore anyway. OAuth with short-lived access tokens plus refresh-token rotation gave the security team a revocation path and let the mobile clients reuse the provider's consent screen. JWT was not removed entirely — it remains the wire format for the access tokens themselves.",
-        "confidence": "high",
-        "citations": [
-            {"id": "c1", "label": "commit a3f21c", "kind": "commit", "url": "#"},
-            {"id": "c2", "label": "PR #142", "kind": "pr", "url": "#"},
-            {"id": "c3", "label": "ADR-011 Token strategy", "kind": "doc", "url": "#"},
-            {"id": "c4", "label": "issue #98", "kind": "issue", "url": "#"},
-        ],
-        "contradiction": "This may conflict with a past decision: commit a3f21c removed the basic-auth fallback for security reasons, so any OAuth outage path must not re-enable it.",
-        "related": [
-            {"id": "d1", "title": "Adopted refresh-token rotation for mobile clients", "when": "3 months ago", "author": "@rin"},
-            {"id": "d2", "title": "Dropped basic-auth fallback from the gateway", "when": "7 months ago", "author": "@marcus"},
-            {"id": "d3", "title": "Moved session store from Redis to Postgres", "when": "9 months ago", "author": "@aditi"},
-            {"id": "d4", "title": "Standardised on 15-minute access token TTL", "when": "1 year ago", "author": "@rin"},
-        ],
-    },
-    {
-        "question": "Why do we still ship a custom useDebounce instead of a library?",
-        "answer": "The team evaluated three third-party debounce hooks in early 2025 and kept the in-house implementation. The deciding factor was bundle weight: the candidates pulled in lodash-style scheduling helpers that added ~4kb gzipped for behaviour the internal version covers in 22 lines. A secondary concern raised in issue #61 was that external hooks flushed pending calls on unmount, which broke the search-as-you-type analytics contract.",
-        "confidence": "medium",
-        "citations": [
-            {"id": "c5", "label": "commit 7b19de", "kind": "commit", "url": "#"},
-            {"id": "c6", "label": "issue #61", "kind": "issue", "url": "#"},
-            {"id": "c7", "label": "PR #77", "kind": "pr", "url": "#"},
-        ],
-        "related": [
-            {"id": "d5", "title": "Set a 12kb budget for the hooks bundle", "when": "5 months ago", "author": "@lena"},
-            {"id": "d6", "title": "Rejected lodash as a runtime dependency", "when": "8 months ago", "author": "@marcus"},
-            {"id": "d7", "title": "Added flush-on-unmount opt-in to useDebounce", "when": "10 months ago", "author": "@lena"},
-        ],
-    },
-    {
-        "question": "Why is the rules engine evaluated server-side only?",
-        "answer": "Server-side evaluation was chosen so the rule set never leaves the audit boundary. Compliance review in 2024 flagged that shipping the DSL to the browser would expose scoring thresholds that clients are contractually not allowed to see. The team accepted the extra round-trip latency (~80ms p95) and added an optimistic UI layer instead. A partial client-side validator exists, but it only checks syntax, never outcomes.",
-        "confidence": "high",
-        "citations": [
-            {"id": "c8", "label": "commit f04a11", "kind": "commit", "url": "#"},
-            {"id": "c9", "label": "ADR-004 Rule evaluation", "kind": "doc", "url": "#"},
-        ],
-        "related": [
-            {"id": "d8", "title": "Added optimistic UI for rule previews", "when": "2 months ago", "author": "@aditi"},
-            {"id": "d9", "title": "Split syntax validation out of the evaluator", "when": "6 months ago", "author": "@jonas"},
-            {"id": "d10", "title": "Introduced immutable audit log for rule runs", "when": "1 year ago", "author": "@aditi"},
-        ],
-    },
-]
-
-MOCK_RECALLS = [
-    {
-        "id": "r1",
-        "title": "Login loop after token refresh on Safari",
-        "summary": "Same symptom class: refresh token rejected because the cookie SameSite attribute was dropped by the proxy. Fixed by pinning SameSite=None; Secure at the gateway.",
-        "similarity": 0.93,
-        "when": "4 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r2",
-        "title": "Intermittent 401s during deploy windows",
-        "summary": "Signing keys were rotated before the old key left the JWKS cache. The rollout order was changed so keys publish one deploy ahead of use.",
-        "similarity": 0.81,
-        "when": "7 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r3",
-        "title": "ADR-011: token strategy and revocation",
-        "summary": "Decision record explaining short-lived access tokens plus rotation, which constrains any fix that lengthens session lifetime.",
-        "similarity": 0.74,
-        "when": "1 year ago",
-        "status": "merged",
-    },
-    {
-        "id": "r4",
-        "title": "Session store migration caused duplicate sessions",
-        "summary": "During the Redis to Postgres cutover, dual writes produced two live sessions per user. Related if the report mentions duplicate devices.",
-        "similarity": 0.62,
-        "when": "9 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r5",
-        "title": "Rate limiter counts refresh calls as logins",
-        "summary": "Open issue with overlapping vocabulary; may be the same root cause if the user is being throttled.",
-        "similarity": 0.48,
-        "when": "3 weeks ago",
-        "status": "open",
-    },
-]
+MOCK_REPOS = []
+MOCK_ANSWERS = []
+MOCK_RECALLS = []
 
 def check_db_empty_for_repo(repo_id: str) -> bool:
     driver = get_neo4j_driver()
@@ -343,7 +497,11 @@ def check_db_empty_for_repo(repo_id: str) -> bool:
     try:
         with driver.session() as session:
             res = session.run(
-                "MATCH (c:Commit {repo: $repo_id}) RETURN count(c) AS count",
+                """
+                MATCH (source {repo: $repo_id})
+                WHERE source:Commit OR source:Issue OR source:PullRequest
+                RETURN count(source) AS count
+                """,
                 repo_id=repo_id
             )
             val = res.single()
@@ -408,6 +566,8 @@ def format_when(iso_date_str: str) -> str:
 def format_source_label(c: dict) -> str:
     stype = (c.get("source_type") or c.get("type") or "commit").lower()
     cid = str(c.get("commit_id") or c.get("id") or "")
+    if stype in ("issue", "pull_request", "pr") and ":" in cid:
+        cid = cid.rsplit(":", 1)[-1]
     display_id = cid[:7] if len(cid) >= 7 else cid
     if stype == "issue":
         return f"Issue [#{display_id}]"
@@ -498,47 +658,199 @@ def call_llm(question: str, context_sentences: List[dict]) -> dict:
 
 @app.get("/repos", response_model=List[RepoResponse])
 def list_repositories():
-    if GITHUB_TOKEN:
-        repos = github_get("/user/repos", {"per_page": 100, "sort": "updated", "affiliation": "owner,collaborator,organization_member"})
-        if repos is not None:
-            return [github_repo_response(repo) for repo in repos]
+    db_repos = []
+    driver = get_neo4j_driver()
+    if driver is not None:
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (r:Repository)
+                    OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
+                    OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
+                    RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
+                    """
+                )
+                for record in result:
+                    db_repos.append({
+                        "id": record["id"],
+                        "name": record["name"],
+                        "description": record["description"] or "No description.",
+                        "language": record["language"] or "Other",
+                        "decisions": record["decisions"] or 0
+                    })
+        except Exception as e:
+            print(f"Error querying Neo4j for repos: {e}")
+        finally:
+            driver.close()
 
+    # If GitHub token is present, we also fetch user's repos
+    gh_repos = []
+    if GITHUB_TOKEN:
+        try:
+            repos = github_get("/user/repos", {"per_page": 100, "sort": "updated", "affiliation": "owner,collaborator,organization_member"})
+            if repos is not None:
+                gh_repos = [github_repo_response(repo) for repo in repos]
+        except Exception as e:
+            print(f"Error calling GitHub API for user repos: {e}")
+
+    # Combine them (avoiding duplicates)
+    # Prefer db_repos (so decisions count is accurate), then gh_repos, then MOCK_REPOS
+    combined = {r["id"]: r for r in db_repos}
+    for r in gh_repos:
+        if r["id"] not in combined:
+            combined[r["id"]] = r
+    for r in MOCK_REPOS:
+        if r["id"] not in combined:
+            combined[r["id"]] = r
+
+    return list(combined.values())
+
+@app.get("/repos/ingest/status/{repo_id:path}")
+def get_ingestion_status(repo_id: str):
+    repo_id = normalize_repo_id(repo_id)
+    if repo_id not in INGESTION_STATUSES:
+        # Check if DB has it
+        is_empty = check_db_empty_for_repo(repo_id)
+        if not is_empty:
+            return {"status": "done"}
+        return {"status": "not_started"}
+    return {"status": INGESTION_STATUSES[repo_id]}
+
+
+@app.get("/repos/monitor/status")
+def get_monitor_status(repoId: str):
+    from orchestrator import get_monitor_run
+    return get_monitor_run(normalize_repo_id(repoId))
+
+
+@app.post("/repos/monitor/run")
+def run_repository_monitor(repoId: str):
+    from orchestrator import get_monitor_run, start_monitoring
+    repo_id = normalize_repo_id(repoId)
+    if check_db_empty_for_repo(repo_id):
+        raise HTTPException(status_code=409, detail="Ingest the repository before starting monitoring")
+    started = start_monitoring(repo_id)
+    return {"repoId": repo_id, "started": started, "run": get_monitor_run(repo_id)}
+
+
+@app.get("/repos/investigations")
+def get_repository_investigations(repoId: str):
+    from orchestrator import get_monitor_run
+    run = get_monitor_run(normalize_repo_id(repoId))
+    return {
+        "repoId": run.get("repoId", normalize_repo_id(repoId)),
+        "status": run.get("status", "not_started"),
+        "steps": run.get("steps", []),
+        "investigations": run.get("results", {}).get("investigations", []),
+    }
+
+
+@app.get("/repos/inbox")
+def get_maintainer_inbox(repoId: str):
+    """Return only selectively escalated issues for the maintainer inbox."""
+    from orchestrator import get_monitor_run
+    run = get_monitor_run(normalize_repo_id(repoId))
+    investigations = run.get("results", {}).get("investigations", [])
+    escalated = [item for item in investigations if item.get("decision") == "escalate"]
+    return {
+        "repoId": normalize_repo_id(repoId),
+        "status": run.get("status", "not_started"),
+        "count": len(escalated),
+        "items": escalated,
+    }
+
+
+@app.get("/repos/graph")
+def get_repository_graph(repoId: str, limit: int = 500):
+    """Return a repository-scoped node/edge graph for Neo4j visualization and tests."""
+    repo_id = normalize_repo_id(repoId)
     driver = get_neo4j_driver()
     if driver is None:
-        return MOCK_REPOS
+        raise HTTPException(status_code=503, detail="Neo4j is unavailable")
 
+    limit = max(1, min(limit, 2000))
+    nodes = {}
+    edges = {}
+    try:
+        with driver.session() as session:
+            node_result = session.run(
+                """
+                MATCH (n)
+                WHERE n.id = $repo_id OR n.id STARTS WITH $prefix
+                RETURN labels(n) AS labels, properties(n) AS properties
+                LIMIT $limit
+                """,
+                repo_id=repo_id,
+                prefix=f"{repo_id}:",
+                limit=limit
+            )
+            for record in node_result:
+                properties = dict(record["properties"] or {})
+                node_id = str(properties.get("id", ""))
+                if node_id:
+                    nodes[node_id] = {
+                        "id": node_id,
+                        "labels": list(record["labels"] or []),
+                        "properties": properties,
+                    }
+
+            edge_result = session.run(
+                """
+                MATCH (source)-[relationship]->(target)
+                WHERE (source.id = $repo_id OR source.id STARTS WITH $prefix)
+                  AND (target.id = $repo_id OR target.id STARTS WITH $prefix)
+                RETURN source.id AS source, type(relationship) AS type,
+                       target.id AS target, properties(relationship) AS properties
+                LIMIT $limit
+                """,
+                repo_id=repo_id,
+                prefix=f"{repo_id}:",
+                limit=limit
+            )
+            for record in edge_result:
+                edge_id = f"{record['source']}|{record['type']}|{record['target']}"
+                edges[edge_id] = {
+                    "source": record["source"],
+                    "target": record["target"],
+                    "type": record["type"],
+                    "properties": dict(record["properties"] or {}),
+                }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to read repository graph: {e}")
+    finally:
+        driver.close()
+
+    return {
+        "repoId": repo_id,
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+        "nodeCount": len(nodes),
+        "edgeCount": len(edges),
+    }
+
+
+@app.get("/repos/graph/summary")
+def get_repository_graph_summary(repoId: str):
+    repo_id = normalize_repo_id(repoId)
+    driver = get_neo4j_driver()
+    if driver is None:
+        raise HTTPException(status_code=503, detail="Neo4j is unavailable")
     try:
         with driver.session() as session:
             result = session.run(
                 """
-                MATCH (r:Repository)
-                OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
-                OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
-                RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
-                """
+                MATCH (n)
+                WHERE n.id = $repo_id OR n.id STARTS WITH $prefix
+                UNWIND labels(n) AS label
+                RETURN label, count(*) AS count
+                ORDER BY label
+                """,
+                repo_id=repo_id,
+                prefix=f"{repo_id}:"
             )
-            repos = []
-            for record in result:
-                repos.append({
-                    "id": record["id"],
-                    "name": record["name"],
-                    "description": record["description"],
-                    "language": record["language"],
-                    "decisions": record["decisions"]
-                })
-            
-            if not repos:
-                return MOCK_REPOS
-            
-            # Ensure mock repos are accessible in the UI
-            for mock_r in MOCK_REPOS:
-                if not any(r["id"] == mock_r["id"] for r in repos):
-                    repos.append(mock_r)
-
-            return repos
-    except Exception as e:
-        print(f"Error querying Neo4j for repos: {e}")
-        return MOCK_REPOS
+            counts = {record["label"]: record["count"] for record in result}
+            return {"repoId": repo_id, "counts": counts, "total": sum(counts.values())}
     finally:
         driver.close()
 
@@ -582,197 +894,1336 @@ def get_repository(repo_id: str):
 
     raise HTTPException(status_code=404, detail="Repository not found")
 
-@app.post("/query", response_model=AnswerResponse)
-def query_decision(req: QueryRequest):
-    if GITHUB_TOKEN and req.repoId.count("/") == 1:
-        commits = github_get(f"/repos/{req.repoId}/commits", {"per_page": 20}) or []
-        words = {word for word in req.question.lower().split() if len(word) > 4}
-        relevant = [
-            commit for commit in commits
-            if words.intersection(set(commit["commit"]["message"].lower().split()))
-        ] or commits[:5]
-        if relevant:
-            citations = []
-            related = []
-            for commit in relevant[:5]:
-                sha = commit["sha"]
-                message = commit["commit"]["message"].split("\n", 1)[0]
-                author = commit["author"]["login"] if commit.get("author") else commit["commit"]["author"]["name"]
-                citations.append({"id": sha[:8], "label": f"commit {sha[:7]}", "kind": "commit", "url": commit["html_url"]})
-                related.append({"id": sha[:8], "title": message, "when": format_when(commit["commit"]["author"]["date"]), "author": f"@{author}"})
-            return {
-                "question": req.question,
-                "answer": "Recent GitHub history for this repository does not contain a dedicated decision record for this question. The closest commit evidence is: " + "; ".join(c["commit"]["message"].split("\n", 1)[0] for c in relevant[:5]),
-                "confidence": "medium" if len(relevant) > 1 else "low",
-                "citations": citations,
-                "related": related,
-            }
+def normalize_repo_id(input_str: str) -> str:
+    input_str = input_str.strip()
+    input_str = input_str.rstrip("/")
+    if "github.com/" in input_str:
+        parts = input_str.split("github.com/")[-1].split("/")
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+    if "git@github.com:" in input_str:
+        parts = input_str.split("git@github.com:")[-1].replace(".git", "").split("/")
+        if len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+    if "/" in input_str:
+        parts = input_str.split("/")
+        return f"{parts[0]}/{parts[1]}"
+    return input_str
 
-    is_mock = any(req.repoId == r["id"] for r in MOCK_REPOS)
-    is_empty = check_db_empty_for_repo(req.repoId)
+def get_node_label_local(source_type: str) -> str:
+    st = (source_type or "").lower()
+    if st == "issue":
+        return "Issue"
+    elif st in ("pull_request", "pr"):
+        return "PullRequest"
+    elif st == "discussion":
+        return "Discussion"
+    elif st == "documentation":
+        return "Documentation"
+    return "Commit"
 
-    if is_mock and is_empty:
-        q_lower = req.question.lower()
-        hit = None
-        for a in MOCK_ANSWERS:
-            keywords = [w for w in a["question"].lower().split() if len(w) > 4]
-            if any(kw in q_lower for kw in keywords):
-                hit = a
-                break
-        
-        if hit:
-            return {
-                "question": req.question,
-                "answer": hit["answer"],
-                "confidence": hit["confidence"],
-                "citations": [Citation(**c) for c in hit["citations"]],
-                "contradiction": hit.get("contradiction"),
-                "related": [Decision(**d) for d in hit["related"]]
+
+def graph_source_id(repo_id: str, source_id: object) -> str:
+    value = str(source_id)
+    return value if value.startswith(f"{repo_id}:") else f"{repo_id}:{value}"
+
+def write_ingested_data_to_neo4j(
+    repo_id: str,
+    repo_meta: dict,
+    commits: list,
+    discussions: list,
+    ast_structure: dict,
+    issues: list
+):
+    driver = get_neo4j_driver()
+    if driver is None:
+        return
+    try:
+        with driver.session() as session:
+            # 1. Merge Repository Node
+            session.run(
+                """
+                MERGE (r:Repository {id: $repo_id})
+                SET r.name = $repo_name,
+                    r.description = $repo_desc,
+                    r.language = $repo_lang,
+                    r.stars = $stars,
+                    r.forks = $forks,
+                    r.topics = $topics,
+                    r.license = $license,
+                    r.owner = $owner
+                """,
+                repo_id=repo_id,
+                repo_name=repo_meta["name"],
+                repo_desc=repo_meta["description"],
+                repo_lang=repo_meta["language"],
+                stars=repo_meta["stars"],
+                forks=repo_meta["forks"],
+                topics=repo_meta.get("topics", []),
+                license=repo_meta["license"],
+                owner=repo_meta["owner"]
+            )
+
+            # 2. Merge Files
+            for f in ast_structure["files"]:
+                session.run(
+                    """
+                    MERGE (f:File {id: $id})
+                    SET f.path = $path, f.name = $name, f.extension = $extension,
+                        f.folder = $folder, f.size_bytes = $size_bytes
+                    WITH f
+                    MATCH (r:Repository {id: $repo_id})
+                    MERGE (f)-[:BELONGS_TO]->(r)
+                    """,
+                    id=f"{repo_id}:{f['id']}",
+                    path=f["path"],
+                    name=f["name"],
+                    extension=f["extension"],
+                    folder=f.get("folder", ""),
+                    size_bytes=f.get("size_bytes", 0),
+                    repo_id=repo_id
+                )
+
+            for imported in ast_structure.get("imports", []):
+                session.run(
+                    """
+                    MATCH (f:File {id: $file_id})
+                    MERGE (m:Module {id: $module_id})
+                    SET m.name = $name
+                    MERGE (f)-[:IMPORTS]->(m)
+                    """,
+                    file_id=f"{repo_id}:{imported['file_id']}",
+                    module_id=f"{repo_id}:module:{imported['name']}",
+                    name=imported["name"]
+                )
+
+            for dependency in ast_structure.get("dependencies", []):
+                session.run(
+                    """
+                    MATCH (f:File {id: $file_id})
+                    MERGE (d:DependencyManifest {id: $dependency_id})
+                    SET d.name = $name, d.content = $content
+                    MERGE (f)-[:DECLARES_DEPENDENCIES]->(d)
+                    """,
+                    file_id=f"{repo_id}:{dependency['file_id']}",
+                    dependency_id=f"{repo_id}:dependency:{dependency['name']}",
+                    name=dependency["name"],
+                    content=dependency["content"]
+                )
+
+            for document in ast_structure.get("documents", []):
+                session.run(
+                    """
+                    MERGE (d:Documentation {id: $document_id})
+                    SET d.path = $path, d.title = $title, d.kind = $kind, d.content = $content, d.url = $url
+                    WITH d
+                    MATCH (r:Repository {id: $repo_id})
+                    MERGE (d)-[:DOCUMENTS]->(r)
+                    """,
+                    document_id=f"{repo_id}:doc:{document['id']}",
+                    path=document["path"],
+                    title=document["title"],
+                    kind=document["kind"],
+                    content=document["content"],
+                    url=document.get("url", f"https://github.com/{repo_id}/blob/main/{document['path']}"),
+                    repo_id=repo_id
+                )
+
+            # 3. Merge Classes
+            for cls in ast_structure["classes"]:
+                session.run(
+                    """
+                    MERGE (c:Class {id: $id})
+                    SET c.name = $name
+                    WITH c
+                    MATCH (f:File {id: $file_id})
+                    MERGE (f)-[:DEFINES]->(c)
+                    """,
+                    id=f"{repo_id}:{cls['id']}",
+                    name=cls["name"],
+                    file_id=f"{repo_id}:{cls['file_id']}"
+                )
+
+            # 4. Merge Functions
+            for func in ast_structure["functions"]:
+                session.run(
+                    """
+                    MERGE (f:Function {id: $id})
+                    SET f.name = $name
+                    WITH f
+                    MATCH (file:File {id: $file_id})
+                    MERGE (file)-[:DEFINES]->(f)
+                    """,
+                    id=f"{repo_id}:{func['id']}",
+                    name=func["name"],
+                    file_id=f"{repo_id}:{func['file_id']}"
+                )
+
+            # 5. Merge Commits Details
+            for c in commits:
+                session.run(
+                    """
+                    MERGE (co:Commit {id: $id})
+                    SET co.message = $message,
+                        co.sha = $sha,
+                        co.title = $title,
+                        co.url = $url,
+                        co.repo = $repo_id,
+                        co.author = $author,
+                        co.date = $date,
+                        co.lines_added = $additions,
+                        co.lines_deleted = $deletions
+                    WITH co
+                    MATCH (r:Repository {id: $repo_id})
+                    MERGE (co)-[:BELONGS_TO]->(r)
+                    """,
+                    id=graph_source_id(repo_id, c["sha"]),
+                    sha=c["sha"],
+                    title=c.get("title", c["message"].split("\n", 1)[0]),
+                    url=c.get("url", "#"),
+                    repo_id=repo_id,
+                    message=c["message"],
+                    author=c["author"],
+                    date=c["date"],
+                    additions=c.get("additions", 0),
+                    deletions=c.get("deletions", 0)
+                )
+
+                # Link committed files if AST File matches
+                for mf in c.get("files", []):
+                    file_node_id = f"{repo_id}:{mf['filepath']}"
+                    session.run(
+                        """
+                        MATCH (co:Commit {id: $commit_id})
+                        MATCH (f:File {id: $file_id})
+                        MERGE (co)-[m:MODIFIED]->(f)
+                        SET m.lines_added = $added, m.lines_deleted = $deleted,
+                            m.diff = $diff, m.status = $status
+                        """,
+                        commit_id=graph_source_id(repo_id, c["sha"]),
+                        file_id=file_node_id,
+                        added=mf.get("added", 0),
+                        deleted=mf.get("deleted", 0),
+                        diff=mf.get("diff", ""),
+                        status=mf.get("status", "")
+                    )
+
+                author_id = f"{repo_id}:user:{c['author']}"
+                session.run(
+                    """
+                    MERGE (u:User {id: $user_id})
+                    SET u.name = $name
+                    WITH u
+                    MATCH (co:Commit {id: $commit_id})
+                    MERGE (co)-[:AUTHORED_BY]->(u)
+                    """,
+                    user_id=author_id,
+                    name=c["author"],
+                    commit_id=graph_source_id(repo_id, c["sha"])
+                )
+
+                for parent_sha in c.get("parents", []):
+                    session.run(
+                        """
+                        MATCH (child:Commit {id: $child_id})
+                        MERGE (parent:Commit {id: $parent_id})
+                        SET parent.repo = $repo_id, parent.sha = $parent_sha
+                        MERGE (child)-[:PARENT_OF]->(parent)
+                        """,
+                        child_id=graph_source_id(repo_id, c["sha"]),
+                        parent_id=graph_source_id(repo_id, parent_sha),
+                        parent_sha=parent_sha,
+                        repo_id=repo_id
+                    )
+
+            # 6. Merge Discussions and comments
+            for d in discussions:
+                session.run(
+                    """
+                    MERGE (di:Discussion {id: $id})
+                    SET di.title = $title, di.body = $body, di.category = $category, di.author = $author
+                    WITH di
+                    MATCH (r:Repository {id: $repo_id})
+                    MERGE (di)-[:BELONGS_TO]->(r)
+                    """,
+                    id=graph_source_id(repo_id, d["id"]),
+                    repo_id=repo_id,
+                    title=d["title"],
+                    body=d["body"],
+                    category=d["category"],
+                    author=d["author"]
+                )
+                session.run(
+                    """
+                    MERGE (u:User {id: $user_id})
+                    SET u.name = $name
+                    WITH u
+                    MATCH (di:Discussion {id: $discussion_id})
+                    MERGE (di)-[:AUTHORED_BY]->(u)
+                    """,
+                    user_id=f"{repo_id}:user:{d['author']}",
+                    name=d["author"],
+                    discussion_id=graph_source_id(repo_id, d["id"])
+                )
+
+                # Merge comments
+                for comment in d.get("comments", []):
+                    session.run(
+                        """
+                        MERGE (cm:Comment {id: $id})
+                        SET cm.body = $body, cm.author = $author
+                        WITH cm
+                        MATCH (di:Discussion {id: $disc_id})
+                        MERGE (di)-[:HAS_COMMENT]->(cm)
+                        """,
+                        id=graph_source_id(repo_id, comment["id"]),
+                        body=comment["body"],
+                        author=comment["author"],
+                        disc_id=graph_source_id(repo_id, d["id"])
+                    )
+                    session.run(
+                        """
+                        MERGE (u:User {id: $user_id})
+                        SET u.name = $name
+                        WITH u
+                        MATCH (cm:Comment {id: $comment_id})
+                        MERGE (cm)-[:AUTHORED_BY]->(u)
+                        """,
+                        user_id=f"{repo_id}:user:{comment['author']}",
+                        name=comment["author"],
+                        comment_id=graph_source_id(repo_id, comment["id"])
+                    )
+
+            # 7. Merge Issues and PRs
+            for item in issues:
+                itype = "Issue" if item["type"] == "issue" else "PullRequest"
+                
+                # Merge main node
+                session.run(
+                    f"""
+                    MERGE (i:{itype} {{id: $id}})
+                    SET i.title = $title,
+                        i.body = $body,
+                        i.repo = $repo_id,
+                        i.state = $state,
+                        i.author = $author,
+                        i.date = $date,
+                        i.updated_at = $updated_at,
+                        i.closed_at = $closed_at,
+                        i.closed_by = $closed_by,
+                        i.url = $url,
+                        i.milestone = $milestone
+                    WITH i
+                    MATCH (r:Repository {{id: $repo_id}})
+                    MERGE (i)-[:BELONGS_TO]->(r)
+                    """,
+                    id=f"{repo_id}:{item['id']}",
+                    title=item["title"],
+                    body=item["body"],
+                    state=item["state"],
+                    author=item["author"],
+                    date=item["date"],
+                    updated_at=item["updated_at"],
+                    closed_at=item.get("closed_at"),
+                    closed_by=item.get("closed_by"),
+                    url=item["url"],
+                    milestone=item.get("milestone"),
+                    repo_id=repo_id
+                )
+
+                session.run(
+                    """
+                    MERGE (u:User {id: $user_id})
+                    SET u.name = $name
+                    WITH u
+                    MATCH (i {id: $item_id})
+                    MERGE (i)-[:AUTHORED_BY]->(u)
+                    """,
+                    user_id=f"{repo_id}:user:{item['author']}",
+                    name=item["author"],
+                    item_id=f"{repo_id}:{item['id']}"
+                )
+                
+                # Merge merged status if Pull Request
+                if item["type"] == "pull_request":
+                    session.run(
+                        """
+                        MATCH (pr:PullRequest {id: $id})
+                        SET pr.merged = $merged,
+                            pr.merged_at = $merged_at,
+                            pr.merge_commit = $merge_commit,
+                            pr.merged_by = $merged_by
+                        """,
+                        id=f"{repo_id}:{item['id']}",
+                        merged=item.get("merged", False),
+                        merged_at=item.get("merged_at"),
+                        merge_commit=item.get("merge_commit"),
+                        merged_by=item.get("merged_by")
+                    )
+
+                    for changed_file in item.get("changed_files", []):
+                        file_id = f"{repo_id}:{changed_file['path']}"
+                        session.run(
+                            """
+                            MERGE (f:File {id: $file_id})
+                            SET f.path = $path, f.name = $name
+                            WITH f
+                            MATCH (pr:PullRequest {id: $pr_id})
+                            MERGE (pr)-[c:CHANGED]->(f)
+                            SET c.lines_added = $added, c.lines_deleted = $deleted,
+                                c.change_type = $change_type
+                            """,
+                            file_id=file_id,
+                            path=changed_file["path"],
+                            name=Path(changed_file["path"]).name,
+                            pr_id=f"{repo_id}:{item['id']}",
+                            added=changed_file.get("additions", 0),
+                            deleted=changed_file.get("deletions", 0),
+                            change_type=changed_file.get("changeType", "")
+                        )
+                    
+                    # Merge reviewers
+                    for rev_name in item.get("reviewers", []):
+                        session.run(
+                            """
+                            MATCH (pr:PullRequest {id: $id})
+                            MERGE (u:User {id: $rev_id})
+                            SET u.name = $rev_name
+                            MERGE (pr)-[:HAS_REVIEWER]->(u)
+                            """,
+                            id=f"{repo_id}:{item['id']}",
+                            rev_id=f"{repo_id}:user:{rev_name}",
+                            rev_name=rev_name
+                        )
+
+                for label_name in item.get("labels", []):
+                    session.run(
+                        f"""
+                        MATCH (i:{itype} {{id: $item_id}})
+                        MERGE (label:Label {{id: $label_id}})
+                        SET label.name = $label_name
+                        MERGE (i)-[:HAS_LABEL]->(label)
+                        """,
+                        item_id=f"{repo_id}:{item['id']}",
+                        label_id=f"{repo_id}:label:{label_name}",
+                        label_name=label_name
+                    )
+
+                # Merge milestone node
+                if item.get("milestone"):
+                    session.run(
+                        f"""
+                        MATCH (i:{itype} {{id: $id}})
+                        MERGE (m:Milestone {{id: $ms_id}})
+                        SET m.title = $title
+                        MERGE (i)-[:HAS_MILESTONE]->(m)
+                        """,
+                        id=f"{repo_id}:{item['id']}",
+                        ms_id=f"{repo_id}:ms:{item['milestone']}",
+                        title=item["milestone"]
+                    )
+
+                # Merge comments
+                for comment in item.get("comments_list", []):
+                    session.run(
+                        f"""
+                        MERGE (cm:Comment {{id: $id}})
+                        SET cm.body = $body, cm.author = $author,
+                            cm.review_state = $review_state,
+                            cm.submitted_at = $submitted_at
+                        WITH cm
+                        MATCH (i:{itype} {{id: $item_id}})
+                        MERGE (i)-[:HAS_COMMENT]->(cm)
+                        """,
+                        id=graph_source_id(repo_id, comment["id"]),
+                        body=comment["body"],
+                        author=comment["author"],
+                        review_state=comment.get("review_state"),
+                        submitted_at=comment.get("submitted_at"),
+                        item_id=f"{repo_id}:{item['id']}"
+                    )
+                    session.run(
+                        """
+                        MERGE (u:User {id: $user_id})
+                        SET u.name = $name
+                        WITH u
+                        MATCH (cm:Comment {id: $comment_id})
+                        MERGE (cm)-[:AUTHORED_BY]->(u)
+                        """,
+                        user_id=f"{repo_id}:user:{comment['author']}",
+                        name=comment["author"],
+                        comment_id=graph_source_id(repo_id, comment["id"])
+                    )
+    except Exception as neo_err:
+        print(f"Failed to write detailed ingestion schema to Neo4j: {neo_err}")
+    finally:
+        driver.close()
+
+def perform_ingestion_background(
+    repo_id: str,
+    owner: str,
+    repo_name: str,
+    repo_desc: str,
+    repo_lang: str,
+    repo_meta: dict,
+    headers: dict,
+    is_sync: bool = False
+):
+    try:
+        last_commit_date = None
+        last_issue_update = None
+        if is_sync:
+            last_commit_date, last_issue_update = get_chroma_sync_timestamps(repo_id)
+        # 1. Fetch Discussions, Issues, and PRs via GraphQL
+        INGESTION_STATUSES[repo_id] = "graphql"
+        discussions = []
+        graphql_issues = []
+        if GITHUB_TOKEN:
+            gql_query = """
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                discussions(first: 30) {
+                  nodes {
+                    id
+                    number
+                    title
+                    body
+                    author {
+                      login
+                    }
+                    category {
+                      name
+                    }
+                    comments(first: 10) {
+                      nodes {
+                        id
+                        body
+                        author {
+                          login
+                        }
+                      }
+                    }
+                  }
+                }
+                issues(first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    id
+                    number
+                    title
+                    body
+                    state
+                    createdAt
+                    updatedAt
+                    url
+                    closedAt
+                    closedBy { login }
+                    author {
+                      login
+                    }
+                    milestone {
+                      title
+                    }
+                    labels(first: 10) {
+                      nodes {
+                        name
+                      }
+                    }
+                    comments(first: 10) {
+                      nodes {
+                        id
+                        body
+                        author {
+                          login
+                        }
+                      }
+                    }
+                  }
+                }
+                pullRequests(first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    id
+                    number
+                    title
+                    body
+                    state
+                    createdAt
+                    updatedAt
+                    url
+                    merged
+                                        mergedAt
+                                        mergeCommit { oid }
+                                        mergedBy { login }
+                                        files(first: 100) {
+                                            nodes {
+                                                path
+                                                additions
+                                                deletions
+                                                changeType
+                                            }
+                                        }
+                                        reviews(first: 30) {
+                                            nodes {
+                                                id
+                                                body
+                                                state
+                                                submittedAt
+                                                author { login }
+                                            }
+                                        }
+                    author {
+                      login
+                    }
+                    milestone {
+                      title
+                    }
+                    labels(first: 10) {
+                      nodes {
+                        name
+                      }
+                    }
+                    reviewRequests(first: 10) {
+                      nodes {
+                        requestedReviewer {
+                          ... on User {
+                            login
+                          }
+                        }
+                      }
+                    }
+                    comments(first: 10) {
+                      nodes {
+                        id
+                        body
+                        author {
+                          login
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
+            """
+            try:
+                gql_res = github_graphql(gql_query, {"owner": owner, "name": repo_name})
+                if gql_res and "data" in gql_res and gql_res["data"] and "repository" in gql_res["data"] and gql_res["data"]["repository"]:
+                    repo_node = gql_res["data"]["repository"]
+                    
+                    # Parse Discussions
+                    disc_nodes = repo_node.get("discussions", {}).get("nodes") or []
+                    for node in disc_nodes:
+                        cmt_nodes = node.get("comments", {}).get("nodes") or []
+                        comments = []
+                        for cmt in cmt_nodes:
+                            comments.append({
+                                "id": cmt["id"],
+                                "body": cmt["body"] or "",
+                                "author": cmt["author"]["login"] if cmt.get("author") else "unknown"
+                            })
+                        discussions.append({
+                            "id": node["id"],
+                            "number": node["number"],
+                            "title": node["title"],
+                            "body": node["body"] or "",
+                            "author": node["author"]["login"] if node.get("author") else "unknown",
+                            "category": node["category"]["name"] if node.get("category") else "General",
+                            "comments": comments
+                        })
+                        
+                    # Parse Issues
+                    issue_nodes = repo_node.get("issues", {}).get("nodes") or []
+                    for node in issue_nodes:
+                        if last_issue_update and node["updatedAt"] <= last_issue_update:
+                            continue
+                        cmt_nodes = node.get("comments", {}).get("nodes") or []
+                        comments = []
+                        for cmt in cmt_nodes:
+                            comments.append({
+                                "id": cmt["id"],
+                                "body": cmt["body"] or "",
+                                "author": cmt["author"]["login"] if cmt.get("author") else "unknown"
+                            })
+                        graphql_issues.append({
+                            "repo": repo_id,
+                            "type": "issue",
+                            "id": str(node["number"]),
+                            "title": node["title"],
+                            "body": node["body"] or "",
+                            "author": node["author"]["login"] if node.get("author") else "unknown",
+                            "date": node["createdAt"],
+                            "updated_at": node["updatedAt"],
+                            "state": node["state"],
+                            "labels": [l["name"] for l in node.get("labels", {}).get("nodes") or []],
+                            "comments": len(comments),
+                            "comments_list": comments,
+                            "url": node["url"],
+                            "closed_at": node.get("closedAt"),
+                            "closed_by": node.get("closedBy", {}).get("login") if node.get("closedBy") else None,
+                            "linked_pull_requests": [],
+                            "linked_commits": [],
+                            "milestone": node["milestone"]["title"] if node.get("milestone") else None,
+                            "merged": False,
+                            "reviewers": []
+                        })
+
+                    # Parse PRs
+                    pr_nodes = repo_node.get("pullRequests", {}).get("nodes") or []
+                    for node in pr_nodes:
+                        if last_issue_update and node["updatedAt"] <= last_issue_update:
+                            continue
+                        cmt_nodes = node.get("comments", {}).get("nodes") or []
+                        comments = []
+                        for cmt in cmt_nodes:
+                            comments.append({
+                                "id": cmt["id"],
+                                "body": cmt["body"] or "",
+                                "author": cmt["author"]["login"] if cmt.get("author") else "unknown"
+                            })
+                        
+                        reviewers = []
+                        req_rev = node.get("reviewRequests", {}).get("nodes") or []
+                        for rr in req_rev:
+                            reviewer = rr.get("requestedReviewer")
+                            if reviewer and "login" in reviewer:
+                                reviewers.append(reviewer["login"])
+
+                        review_comments = []
+                        for review in node.get("reviews", {}).get("nodes") or []:
+                            review_comments.append({
+                                "id": review["id"],
+                                "body": review.get("body") or "",
+                                "author": review.get("author", {}).get("login") if review.get("author") else "unknown",
+                                "review_state": review.get("state"),
+                                "submitted_at": review.get("submittedAt")
+                            })
+                                
+                        graphql_issues.append({
+                            "repo": repo_id,
+                            "type": "pull_request",
+                            "id": str(node["number"]),
+                            "title": node["title"],
+                            "body": node["body"] or "",
+                            "author": node["author"]["login"] if node.get("author") else "unknown",
+                            "date": node["createdAt"],
+                            "updated_at": node["updatedAt"],
+                            "state": node["state"],
+                            "labels": [l["name"] for l in node.get("labels", {}).get("nodes") or []],
+                            "comments": len(comments),
+                            "comments_list": comments + review_comments,
+                            "url": node["url"],
+                            "milestone": node["milestone"]["title"] if node.get("milestone") else None,
+                            "merged": node["merged"],
+                            "merged_at": node.get("mergedAt"),
+                            "merge_commit": node.get("mergeCommit", {}).get("oid") if node.get("mergeCommit") else None,
+                            "merged_by": node.get("mergedBy", {}).get("login") if node.get("mergedBy") else None,
+                            "changed_files": node.get("files", {}).get("nodes") or [],
+                            "reviewers": reviewers
+                        })
+            except Exception as e:
+                print(f"GraphQL discussions/issues/PRs fetch failed for {repo_id}: {e}")
+
+        # 2. Clone Repository only for a full ingest; sync uses API data only.
+        INGESTION_STATUSES[repo_id] = "cloning"
+        ast_structure = {"files": [], "classes": [], "functions": [], "imports": [], "dependencies": [], "documents": [], "relationships": []}
+        commits_pydriller = []
+        clone_url = f"https://github.com/{owner}/{repo_name}.git"
+        git_path = shutil.which("git") or "git"
         
+        if not is_sync:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+                try:
+                    print(f"Cloning {clone_url} to temporary directory...")
+                    subprocess.run(
+                        [git_path, "clone", "--depth", "30", clone_url, tmp_dir],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=45
+                    )
+                    tmp_path = Path(tmp_dir)
+                    
+                    # 3. Code AST analysis
+                    INGESTION_STATUSES[repo_id] = "ast_parsing"
+                    ast_structure = parse_code_structure(tmp_path)
+
+                    wiki_path = tmp_path / "__wiki__"
+                    try:
+                        subprocess.run(
+                            [git_path, "clone", "--depth", "1", f"https://github.com/{owner}/{repo_name}.wiki.git", str(wiki_path)],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            timeout=30
+                        )
+                        ast_structure["documents"].extend(parse_wiki_documents(wiki_path, repo_id))
+                    except Exception as wiki_err:
+                        print(f"Wiki unavailable for {repo_id}; continuing without wiki pages: {wiki_err}")
+                    
+                    # 4. Commit mining
+                    INGESTION_STATUSES[repo_id] = "commits"
+                    commits_pydriller = mine_commits_locally(tmp_path)
+                except Exception as clone_err:
+                    print(f"Failed to clone/mine repository: {clone_err}")
+
+        # 5. Fetch Issues & PRs
+        INGESTION_STATUSES[repo_id] = "issues"
+        # Fetch last 30 commits via REST API
+        try:
+            commit_params = {"per_page": 30}
+            if last_commit_date:
+                commit_params["since"] = last_commit_date
+            c_res = requests.get(
+                f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/commits",
+                headers=headers,
+                params=commit_params,
+                timeout=15
+            )
+            c_res.raise_for_status()
+            raw_commits = c_res.json()
+        except Exception as e:
+            print(f"Error fetching commits for {repo_id}: {e}")
+            raw_commits = []
+
+        commits = []
+        for c in raw_commits:
+            c_date = c.get("commit", {}).get("author", {}).get("date", "")
+            if last_commit_date and c_date and c_date <= last_commit_date:
+                continue
+            pyd_match = next((item for item in commits_pydriller if item["sha"] == c["sha"]), {})
+            detail = github_get(f"/repos/{owner}/{repo_name}/commits/{c['sha']}") or {}
+            detail_files = []
+            for changed_file in detail.get("files", []):
+                detail_files.append({
+                    "filename": changed_file.get("filename", ""),
+                    "filepath": changed_file.get("filename", ""),
+                    "added": changed_file.get("additions", 0),
+                    "deleted": changed_file.get("deletions", 0),
+                    "diff": changed_file.get("patch", "") or "",
+                    "status": changed_file.get("status", "")
+                })
+            commits.append({
+                "repo": repo_id,
+                "type": "commit",
+                "id": c["sha"],
+                "sha": c["sha"],
+                "title": c["commit"]["message"].split("\n")[0],
+                "body": c["commit"]["message"],
+                "message": c["commit"]["message"],
+                "author": c["commit"]["author"]["name"] if c.get("commit", {}).get("author") else "unknown",
+                "date": c["commit"]["author"]["date"] if c.get("commit", {}).get("author") else "",
+                "url": c["html_url"],
+                "additions": detail.get("stats", {}).get("additions", pyd_match.get("additions") or 0),
+                "deletions": detail.get("stats", {}).get("deletions", pyd_match.get("deletions") or 0),
+                "files": detail_files or pyd_match.get("files") or [],
+                "parents": [parent.get("sha") for parent in detail.get("parents", [])] or pyd_match.get("parents") or []
+            })
+
+        for pyd in commits_pydriller:
+            if last_commit_date and pyd["date"] and pyd["date"] <= last_commit_date:
+                continue
+            if not any(c["sha"] == pyd["sha"] for c in commits):
+                commits.append({
+                    "repo": repo_id,
+                    "type": "commit",
+                    "id": pyd["sha"],
+                    "sha": pyd["sha"],
+                    "title": pyd["message"].split("\n")[0],
+                    "body": pyd["message"],
+                    "message": pyd["message"],
+                    "author": pyd["author"],
+                    "date": pyd["date"],
+                    "url": f"https://github.com/{repo_id}/commit/{pyd['sha']}",
+                    "additions": pyd["additions"],
+                    "deletions": pyd["deletions"],
+                    "files": pyd["files"],
+                    "parents": pyd["parents"]
+                })
+
+        if graphql_issues:
+            issues = graphql_issues
+        else:
+            try:
+                i_res = requests.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/issues?per_page=30", headers=headers, timeout=15)
+                i_res.raise_for_status()
+                raw_issues = i_res.json()
+            except Exception as e:
+                print(f"Error fetching issues/PRs for {repo_id}: {e}")
+                raw_issues = []
+
+            issues = []
+            for item in raw_issues:
+                if last_issue_update and item.get("updated_at") and item["updated_at"] <= last_issue_update:
+                    continue
+                is_pr = "pull_request" in item
+                issues.append({
+                    "repo": repo_id,
+                    "type": "pull_request" if is_pr else "issue",
+                    "id": str(item["number"]),
+                    "title": item["title"],
+                    "body": item.get("body") or "",
+                    "author": item["user"]["login"] if item.get("user") else "unknown",
+                    "date": item["created_at"],
+                    "updated_at": item["updated_at"],
+                    "state": item["state"],
+                    "labels": [l["name"] for l in item.get("labels", [])],
+                    "comments": item.get("comments", 0),
+                    "comments_list": [],
+                    "url": item["html_url"],
+                    "milestone": item.get("milestone", {}).get("title") if item.get("milestone") else None,
+                    "merged": False,
+                    "reviewers": []
+                })
+
+        # 5.5. Normalize data through Repository Intelligence Pipeline
+        from intelligence_pipeline import RepositoryIntelligencePipeline
+        intel_pipeline = RepositoryIntelligencePipeline(repo_id)
+        norm_res = intel_pipeline.normalize_pipeline(commits, discussions, issues)
+        commits = norm_res["commits"]
+        discussions = norm_res["discussions"]
+        issues = norm_res["issues"]
+        cross_references = norm_res["cross_references"]
+
+        raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / f"{repo_name}_issues.json").write_text(
+            json.dumps(issues, indent=2), encoding="utf-8"
+        )
+
+        # 6. Extract Rationale
+        INGESTION_STATUSES[repo_id] = "extracting_rationale"
+        from extractor import extract_rationale
+        all_text_records = []
+        for c in commits:
+            all_text_records.append({
+                "id": c["sha"],
+                "type": "commit",
+                "body": c["body"],
+                "title": c["title"],
+                "repo": repo_id,
+                "url": c["url"],
+                "author": c["author"],
+                "date": c["date"]
+            })
+        for i in issues:
+            all_text_records.append({
+                "id": i["id"],
+                "type": i["type"],
+                "body": i["body"],
+                "title": i["title"],
+                "repo": repo_id,
+                "url": i["url"],
+                "author": i["author"],
+                "date": i["date"],
+                "updated_at": i.get("updated_at", "")
+            })
+        for d in discussions:
+            all_text_records.append({
+                "id": d["id"],
+                "type": "discussion",
+                "body": d["body"],
+                "title": d["title"],
+                "repo": repo_id,
+                "url": f"https://github.com/{repo_id}/discussions/{d['number']}",
+                "author": d["author"],
+                "date": ""
+            })
+        for document in ast_structure.get("documents", []):
+            all_text_records.append({
+                "id": f"doc:{document['id']}",
+                "type": "documentation",
+                "body": document["content"],
+                "title": document["title"],
+                "repo": repo_id,
+                "url": document.get("url", f"https://github.com/{repo_id}/blob/main/{document['path']}"),
+                "author": "repository",
+                "date": ""
+            })
+        extracted_records = extract_rationale(all_text_records)
+        for record in extracted_records:
+            record["source_id"] = graph_source_id(repo_id, record["source_id"])
+
+        # 7. Write to Neo4j
+        INGESTION_STATUSES[repo_id] = "indexing"
+        write_ingested_data_to_neo4j(repo_id, repo_meta, commits, discussions, ast_structure, issues)
+        
+        driver = get_neo4j_driver()
+        if driver is not None:
+            try:
+                with driver.session() as session:
+                    # Write Rationale records
+                    for r_item in extracted_records:
+                        stype = r_item.get("source_type") or r_item.get("type", "commit")
+                        label = get_node_label_local(stype)
+                        cypher = f"""
+                        MERGE (r:Repository {{id: $repo_id}})
+                        MERGE (c:{label} {{id: $source_id}})
+                        SET c.repo = $repo_id, c.url = $source_url, c.has_rationale = $has_rationale, c.type = $type
+                        MERGE (c)-[:BELONGS_TO]->(r)
+                        WITH c
+                        UNWIND $sentences AS sentence
+                        MERGE (rat:Rationale {{text: sentence, commit_id: $source_id}})
+                        MERGE (c)-[:HAS_RATIONALE]->(rat)
+                        """
+                        session.run(
+                            cypher,
+                            repo_id=repo_id,
+                            source_id=str(r_item["source_id"]),
+                            source_url=r_item["source_url"],
+                            has_rationale=r_item["has_rationale"],
+                            type=stype,
+                            sentences=r_item["rationale_sentences"],
+                        )
+                    
+                    # Write cross references
+                    for ref in cross_references:
+                        source_id = graph_source_id(repo_id, ref["source_id"])
+                        st = ref["source_type"]
+                        slabel = get_node_label_local(st) if st != "comment" else "Comment"
+                        
+                        if slabel == "Comment":
+                            cypher_source = "MATCH (s:Comment {id: $source_id})"
+                        else:
+                            cypher_source = f"MATCH (s:{slabel} {{id: $source_id}})"
+
+                        target_id = ref["target_id"]
+                        tt = ref["target_type"]
+                        rel = ref["relationship"]
+                        
+                        if tt == "Issue_or_PR":
+                            cypher_ref = cypher_source + f"""
+                            OPTIONAL MATCH (i:Issue {{id: $target_id}})
+                            OPTIONAL MATCH (pr:PullRequest {{id: $target_id}})
+                            WITH s, coalesce(i, pr) AS targetNode
+                            WHERE targetNode IS NOT NULL
+                            MERGE (s)-[r:{rel}]->(targetNode)
+                            """
+                        else:
+                            if tt == "Commit":
+                                target_id = graph_source_id(repo_id, target_id)
+                            cypher_ref = cypher_source + f"""
+                            MATCH (t:Commit {{id: $target_id}})
+                            MERGE (s)-[r:{rel}]->(t)
+                            """
+                            
+                        session.run(cypher_ref, source_id=source_id, target_id=target_id)
+            except Exception as neo_err:
+                print(f"Failed to save rationale/references to Neo4j: {neo_err}")
+            finally:
+                driver.close()
+
+        # 8. Write to Chroma
+        chroma = get_chroma_client()
+        if HAS_EMBEDDINGS and chroma:
+            from graph_store import write_to_chroma
+            try:
+                write_to_chroma(chroma, model, extracted_records)
+            except Exception as chroma_err:
+                print(f"Failed to save to Chroma during ingest: {chroma_err}")
+
+        from orchestrator import start_monitoring
+        start_monitoring(repo_id)
+        INGESTION_STATUSES[repo_id] = "done"
+    except Exception as e:
+        print(f"Failed to perform background ingestion for {repo_id}: {e}")
+        INGESTION_STATUSES[repo_id] = f"error: {str(e)}"
+
+@app.post("/repos/ingest", response_model=RepoResponse)
+def ingest_repository(req: IngestRequest):
+    repo_id = normalize_repo_id(req.repoUrl)
+    if "/" not in repo_id:
+        raise HTTPException(status_code=400, detail="Invalid repository URL or format. Use 'owner/repo' or GitHub URL.")
+        
+    owner, repo_name = repo_id.split("/", 1)
+    
+    # 1. Fetch Repository Metadata
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    try:
+        res = requests.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}", headers=headers, timeout=15)
+        if res.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"GitHub repository '{repo_id}' not found or is private.")
+        res.raise_for_status()
+        repo_info = res.json()
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=502, detail=f"Failed to fetch repository info from GitHub API: {e}")
+
+    repo_desc = repo_info.get("description") or "No description provided."
+    repo_lang = repo_info.get("language") or "Other"
+    
+    repo_meta = {
+        "name": repo_name,
+        "description": repo_desc,
+        "language": repo_lang,
+        "topics": repo_info.get("topics") or [],
+        "stars": repo_info.get("stargazers_count") or 0,
+        "forks": repo_info.get("forks_count") or 0,
+        "license": repo_info.get("license", {}).get("name") if repo_info.get("license") else "None",
+        "owner": owner
+    }
+    decisions_count = 0
+
+    # Check if this repo has already been ingested
+    is_empty = check_db_empty_for_repo(repo_id)
+    if not is_empty:
+        # Get decision count from Neo4j DB
+        decisions_count = 0
+        driver = get_neo4j_driver()
+        if driver is not None:
+            try:
+                with driver.session() as session:
+                    res = session.run(
+                        """
+                        MATCH (r:Repository {id: $repo_id})
+                        OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
+                        OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
+                        RETURN count(rat) AS decisions
+                        """,
+                        repo_id=repo_id
+                    )
+                    record = res.single()
+                    if record:
+                        decisions_count = record["decisions"]
+            except Exception as neo_err:
+                print(f"Error querying decision count for {repo_id}: {neo_err}")
+            finally:
+                driver.close()
+                
         return {
-            "question": req.question,
-            "answer": "Based on the indexed history for this repository, there is no decision record matching this query in the static mocks.",
-            "confidence": "low",
-            "citations": [
-                {"id": "cf1", "label": "commit 91cc02", "kind": "commit", "url": "#"},
-                {"id": "cf2", "label": "PR #205", "kind": "pr", "url": "#"}
-            ],
-            "related": [
-                {"id": "df1", "title": "Review comments migrated into ADR format", "when": "4 months ago", "author": "@jonas"},
-                {"id": "df2", "title": "Backfilled decision index for legacy commits", "when": "11 months ago", "author": "@rin"}
-            ]
+            "id": repo_id,
+            "name": repo_name,
+            "description": repo_desc,
+            "language": repo_lang,
+            "decisions": decisions_count
         }
 
-    # Retrieve context
-    search_res = []
+    # Launch background thread if not already running
+    if repo_id not in INGESTION_STATUSES or INGESTION_STATUSES[repo_id].startswith("error"):
+        INGESTION_STATUSES[repo_id] = "graphql"
+        t = threading.Thread(
+            target=perform_ingestion_background,
+            args=(repo_id, owner, repo_name, repo_desc, repo_lang, repo_meta, headers)
+        )
+        t.start()
+
+    return {
+        "id": repo_id,
+        "name": repo_name,
+        "description": repo_desc,
+        "language": repo_lang,
+        "decisions": decisions_count
+    }
+
+@app.post("/repos/sync", response_model=RepoResponse)
+def sync_repository(req: IngestRequest):
+    repo_id = normalize_repo_id(req.repoUrl)
+    if "/" not in repo_id:
+        raise HTTPException(status_code=400, detail="Invalid repository URL or format. Use 'owner/repo' or GitHub URL.")
+        
+    owner, repo_name = repo_id.split("/", 1)
     
-    # Try Qdrant semantic search if embeddings are working
-    qdrant = get_qdrant_client()
-    if HAS_EMBEDDINGS and qdrant:
-        try:
-            if qdrant.collection_exists(COLLECTION_NAME):
-                query_vector = model.encode(req.question).tolist()
-                hits = qdrant.search(
-                    collection_name=COLLECTION_NAME,
-                    query_vector=query_vector,
-                    limit=5,
-                    query_filter=Filter(
-                        must=[FieldCondition(key="repo", match=MatchValue(value=req.repoId))]
-                    )
-                )
-                for h in hits:
-                    search_res.append({
-                        "text": h.payload["text"],
-                        "commit_id": h.payload["commit_id"],
-                        "type": h.payload.get("type", "commit"),
-                        "url": h.payload.get("url", "#"),
-                        "score": h.score
-                    })
-        except Exception as e:
-            print(f"Qdrant search failed, falling back to Neo4j text search: {e}")
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-    # Fallback to database keyword search if Qdrant returned nothing or failed
-    if not search_res:
-        print("Using Neo4j keyword search...")
-        search_res = search_neo4j_keywords(req.repoId, req.question)
+    try:
+        res = requests.get(f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}", headers=headers, timeout=15)
+        if res.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"GitHub repository '{repo_id}' not found or is private.")
+        res.raise_for_status()
+        repo_info = res.json()
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=502, detail=f"Failed to fetch repository info from GitHub API: {e}")
 
-    if not search_res:
-        raise HTTPException(status_code=404, detail="No matching rationale entries found in this repository.")
+    repo_desc = repo_info.get("description") or "No description provided."
+    repo_lang = repo_info.get("language") or "Other"
+    
+    repo_meta = {
+        "name": repo_name,
+        "description": repo_desc,
+        "language": repo_lang,
+        "topics": repo_info.get("topics") or [],
+        "stars": repo_info.get("stargazers_count") or 0,
+        "forks": repo_info.get("forks_count") or 0,
+        "license": repo_info.get("license", {}).get("name") if repo_info.get("license") else "None",
+        "owner": owner
+    }
 
-    # Pull details from Neo4j
+    # Start background ingestion sync thread
+    INGESTION_STATUSES[repo_id] = "graphql"
+    t = threading.Thread(
+         target=perform_ingestion_background,
+         args=(repo_id, owner, repo_name, repo_desc, repo_lang, repo_meta, headers, True)
+    )
+    t.start()
+
+    decisions_count = 0
     driver = get_neo4j_driver()
-    context_sentences = []
-    citations = []
-    related = []
-    
     if driver is not None:
         try:
             with driver.session() as session:
-                for hit in search_res:
-                    commit_id = hit["commit_id"]
-                    
-                    res = session.run(
-                        """
-                        MATCH (c {id: $commit_id})
-                        RETURN c.repo AS repo, c.url AS url, c.author AS author, c.date AS date, c.title AS title, c.type AS type
-                        """,
-                        commit_id=commit_id
-                    )
-                    record = res.single()
-                    
-                    author = "@unknown"
-                    date_str = ""
-                    title = ""
-                    url = hit["url"]
-                    stype = hit.get("type", "commit")
-                    
-                    if record:
-                        if record.get("author"):
-                            author = f"@{record['author'].lower().replace(' ', '')}"
-                        date_str = format_when(record.get("date"))
-                        title = record.get("title") or ""
-                        url = record.get("url") or url
-                        stype = record.get("type") or stype
-
-                    context_sentences.append({
-                        "text": hit["text"],
-                        "commit_id": commit_id,
-                        "source_type": stype,
-                        "author": author,
-                        "date": date_str,
-                        "score": hit["score"]
-                    })
-                    
-                    stype_lower = str(stype).lower()
-                    display_cid = commit_id[:6] if len(commit_id) >= 6 else commit_id
-                    if stype_lower == "issue":
-                        kind = "issue"
-                        label = f"issue #{commit_id}"
-                    elif stype_lower in ("pull_request", "pr"):
-                        kind = "pr"
-                        label = f"PR #{commit_id}"
-                    else:
-                        kind = "commit"
-                        label = f"commit {display_cid}"
-
-                    citations.append({
-                        "id": f"c_{display_cid}",
-                        "label": label,
-                        "kind": kind,
-                        "url": url
-                    })
-                    
-                    related.append({
-                        "id": f"d_{display_cid}",
-                        "title": title or hit["text"],
-                        "when": date_str,
-                        "author": author
-                    })
+                res = session.run(
+                    """
+                    MATCH (r:Repository {id: $repo_id})
+                    OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
+                    OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
+                    RETURN count(rat) AS decisions
+                    """,
+                    repo_id=repo_id
+                )
+                record = res.single()
+                if record:
+                    decisions_count = record["decisions"]
+        except Exception as neo_err:
+            print(f"Error querying decision count for {repo_id}: {neo_err}")
         finally:
             driver.close()
-    else:
-        # Fallback if Neo4j is offline but Qdrant is somehow online
-        for hit in search_res:
-            context_sentences.append({
-                "text": hit["text"],
-                "commit_id": hit["commit_id"],
-                "author": "@unknown",
-                "date": "recently",
-                "score": hit["score"]
-            })
-            citations.append({
-                "id": f"c_{hit['commit_id'][:6]}",
-                "label": f"commit {hit['commit_id'][:6]}",
-                "kind": "commit",
-                "url": hit["url"]
-            })
-            related.append({
-                "id": f"d_{hit['commit_id'][:6]}",
-                "title": hit["text"],
-                "when": "recently",
-                "author": "@unknown"
-            })
+
+    return {
+        "id": repo_id,
+        "name": repo_name,
+        "description": repo_desc,
+        "language": repo_lang,
+        "decisions": decisions_count
+    }
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """Receive GitHub activity and enqueue repository-scoped incremental sync."""
+    if not GITHUB_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="GITHUB_WEBHOOK_SECRET is not configured")
+
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    expected = "sha256=" + hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid GitHub webhook signature")
+
+    payload = json.loads(body.decode("utf-8")) if body else {}
+    event = request.headers.get("X-GitHub-Event", "ping")
+    if event == "ping":
+        return {"accepted": True, "event": "ping"}
+
+    repo_id = (payload.get("repository") or {}).get("full_name")
+    if not repo_id:
+        raise HTTPException(status_code=400, detail="Webhook payload has no repository")
+
+    supported_events = {"push", "issues", "issue_comment", "pull_request", "pull_request_review", "discussion", "discussion_comment", "create", "delete"}
+    if event not in supported_events:
+        return {"accepted": True, "event": event, "ignored": True, "reason": "unsupported event"}
+
+    sync_repository(IngestRequest(repoUrl=repo_id))
+    return {"accepted": True, "event": event, "repoId": repo_id, "queued": True}
+
+@app.post("/repos/query", response_model=AnswerResponse)
+@app.post("/query", response_model=AnswerResponse)
+def query_decision(req: QueryRequest):
+    # Retrieve context
+    search_res = []
+    if not HAS_EMBEDDINGS:
+        raise HTTPException(status_code=503, detail="RAG embedding model is unavailable")
+
+    chroma = get_chroma_client()
+    if chroma:
+        try:
+            collection = chroma.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"}
+            )
+            query_vector = model.encode(req.question).tolist()
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=5,
+                where={"repo": req.repoId}
+            )
+            if results and "ids" in results and results["ids"]:
+                ids = results["ids"][0]
+                distances = results["distances"][0] if "distances" in results and results["distances"] else []
+                metadatas = results["metadatas"][0] if "metadatas" in results and results["metadatas"] else []
+                documents = results["documents"][0] if "documents" in results and results["documents"] else []
+                for i, doc_id in enumerate(ids):
+                    meta = metadatas[i] if i < len(metadatas) else {}
+                    doc = documents[i] if i < len(documents) else ""
+                    dist = distances[i] if i < len(distances) else 0.0
+                    similarity = 1.0 - dist
+                    search_res.append({
+                        "text": doc or meta.get("text") or "",
+                        "commit_id": meta.get("source_id") or meta.get("commit_id"),
+                        "type": meta.get("type", "commit"),
+                        "url": meta.get("url", "#"),
+                        "title": meta.get("title", ""),
+                        "author": meta.get("author", "unknown"),
+                        "date": meta.get("date", ""),
+                        "score": similarity
+                    })
+        except Exception as e:
+            print(f"Chroma search failed, falling back to Neo4j text search: {e}")
+
+    if not search_res:
+        raise HTTPException(status_code=404, detail="No matching rationale entries found in Chroma for this repository.")
+
+    graph_hits = search_neo4j_keywords(req.repoId, req.question, limit=5)
+    seen_evidence = {(hit.get("commit_id"), hit.get("text")) for hit in search_res}
+    for hit in graph_hits:
+        evidence_key = (hit.get("commit_id"), hit.get("text"))
+        if evidence_key not in seen_evidence:
+            search_res.append(hit)
+            seen_evidence.add(evidence_key)
+        if len(search_res) >= 8:
+            break
+
+    context_sentences = []
+    citations = []
+    related = []
+    for hit in search_res:
+        commit_id = str(hit.get("commit_id") or "unknown")
+        stype = hit.get("type", "commit")
+        stype_lower = str(stype).lower()
+        source_number = commit_id.rsplit(":", 1)[-1]
+        display_cid = source_number[:7]
+        author_value = hit.get("author") or "unknown"
+        author = author_value if str(author_value).startswith("@") else f"@{author_value}"
+        date_str = format_when(hit.get("date"))
+
+        context_sentences.append({
+            "text": hit["text"],
+            "commit_id": commit_id,
+            "source_type": stype,
+            "author": author,
+            "date": date_str,
+            "score": hit["score"]
+        })
+
+        if stype_lower == "issue":
+            kind = "issue"
+            label = f"issue #{source_number}"
+        elif stype_lower in ("pull_request", "pr"):
+            kind = "pr"
+            label = f"PR #{source_number}"
+        else:
+            kind = "commit"
+            label = f"commit {display_cid}"
+
+        citations.append({
+            "id": f"c_{display_cid}",
+            "label": label,
+            "kind": kind,
+            "url": hit["url"]
+        })
+        related.append({
+            "id": f"d_{display_cid}",
+            "title": hit.get("title") or hit["text"],
+            "when": date_str,
+            "author": author
+        })
 
     # Synthesize LLM answer
     synthesis = call_llm(req.question, context_sentences)
@@ -804,30 +2255,39 @@ def recall_issue(req: RecallRequest):
 
     search_res = []
     
-    # Try Qdrant semantic search first
-    qdrant = get_qdrant_client()
-    if HAS_EMBEDDINGS and qdrant:
+    # Try Chroma semantic search first
+    chroma = get_chroma_client()
+    if HAS_EMBEDDINGS and chroma:
         try:
-            if qdrant.collection_exists(COLLECTION_NAME):
-                text_to_embed = f"{req.title}\n{req.body}"
-                query_vector = model.encode(text_to_embed).tolist()
-                hits = qdrant.search(
-                    collection_name=COLLECTION_NAME,
-                    query_vector=query_vector,
-                    limit=5,
-                    query_filter=Filter(
-                        must=[FieldCondition(key="repo", match=MatchValue(value=req.repoId))]
-                    )
-                )
-                for h in hits:
+            collection = chroma.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"}
+            )
+            text_to_embed = f"{req.title}\n{req.body}"
+            query_vector = model.encode(text_to_embed).tolist()
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=5,
+                where={"repo": req.repoId}
+            )
+            if results and "ids" in results and results["ids"]:
+                ids = results["ids"][0]
+                distances = results["distances"][0] if "distances" in results and results["distances"] else []
+                metadatas = results["metadatas"][0] if "metadatas" in results and results["metadatas"] else []
+                documents = results["documents"][0] if "documents" in results and results["documents"] else []
+                for i, doc_id in enumerate(ids):
+                    meta = metadatas[i] if i < len(metadatas) else {}
+                    doc = documents[i] if i < len(documents) else ""
+                    dist = distances[i] if i < len(distances) else 0.0
+                    similarity = 1.0 - dist
                     search_res.append({
-                        "text": h.payload["text"],
-                        "commit_id": h.payload["commit_id"],
-                        "url": h.payload.get("url", "#"),
-                        "score": h.score
+                        "text": doc or meta.get("text") or "",
+                        "commit_id": meta.get("commit_id"),
+                        "url": meta.get("url", "#"),
+                        "score": similarity
                     })
         except Exception as e:
-            print(f"Qdrant search failed in recall, falling back: {e}")
+            print(f"Chroma search failed in recall, falling back: {e}")
 
     # Fallback to database keyword search
     if not search_res:
@@ -926,6 +2386,25 @@ def agent_scan(repoId: str):
     data = run_repo_scan(repo_slug, repoId, issues)
     return data
 
+
+@app.post("/agent/follow-up")
+def agent_follow_up(req: FollowUpRequest):
+    from agent import contributor_follow_up
+    repo_id = normalize_repo_id(req.repoId)
+    issues_path = Path(__file__).resolve().parent.parent / "data" / "raw" / f"{repo_id.split('/')[-1]}_issues.json"
+    if not issues_path.exists():
+        raise HTTPException(status_code=404, detail="No normalized issue data found for this repository")
+    issues = json.loads(issues_path.read_text(encoding="utf-8"))
+    issue = next((item for item in issues if str(item.get("id")) == str(req.issueNumber) and item.get("type") == "issue"), None)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found in the repository index")
+    follow_up = contributor_follow_up(issue)
+    response = {"repoId": repo_id, "issueNumber": req.issueNumber, **follow_up, "posted": False}
+    if req.execute and follow_up["needs_follow_up"]:
+        agent_comment(CommentRequest(repoId=repo_id, issueNumber=req.issueNumber, message=follow_up["message"]))
+        response["posted"] = True
+    return response
+
 class CommentRequest(BaseModel):
     repoId: str
     issueNumber: str
@@ -1009,6 +2488,12 @@ def get_health(repoId: str):
 
     return compute_health(repoId)
 
+
+@app.get("/health/investigation")
+def get_health_investigation(repoId: str):
+    from health import investigate_health_trend
+    return investigate_health_trend(normalize_repo_id(repoId))
+
 @app.get("/brief")
 def get_brief(repoId: str):
     from brief import generate_weekly_brief
@@ -1021,7 +2506,14 @@ def agent_feedback(req: FeedbackRequest):
     from datetime import datetime, timezone
     
     timestamp = datetime.now(timezone.utc).isoformat()
-    repo_slug = req.repoId.split('/')[-1]
+    repo_id = normalize_repo_id(req.repoId)
+    repo_slug = repo_id.split('/')[-1]
+    allowed_actions = {"confirm", "not_important", "duplicate", "wrong"}
+    action = req.action or ("confirm" if req.correct else "wrong")
+    if action not in allowed_actions:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sorted(allowed_actions)}")
+    human_decision = req.correctedDecision or action
+    issue_graph_id = graph_source_id(repo_id, req.issueId)
     
     # Try Neo4j first
     driver = None
@@ -1036,22 +2528,27 @@ def agent_feedback(req: FeedbackRequest):
             with driver.session() as session:
                 session.run(
                     """
-                    MERGE (c {id: $issue_id})
-                    ON CREATE SET c.repo = $repo_id, c.type = "issue"
+                    MERGE (c:Issue {id: $issue_id})
+                    SET c.repo = $repo_id, c.type = "issue"
                     WITH c
                     CREATE (f:Feedback {
                         decision: $decision,
+                        humanDecision: $human_decision,
+                        action: $action,
                         correct: $correct,
-                        correctedDecision: $corrected_decision,
+                        correctedDecision: $human_decision,
+                        note: $note,
                         timestamp: $timestamp
                     })
                     CREATE (c)-[:HAS_FEEDBACK]->(f)
                     """,
-                    issue_id=str(req.issueId),
-                    repo_id=req.repoId,
+                    issue_id=issue_graph_id,
+                    repo_id=repo_id,
                     decision=req.decision,
+                    human_decision=human_decision,
+                    action=action,
                     correct=req.correct,
-                    corrected_decision=req.correctedDecision,
+                    note=req.note,
                     timestamp=timestamp
                 )
                 neo4j_success = True
@@ -1076,11 +2573,13 @@ def agent_feedback(req: FeedbackRequest):
                 feedbacks = []
                 
         feedbacks.append({
-            "repoId": req.repoId,
+            "repoId": repo_id,
             "issueId": req.issueId,
             "decision": req.decision,
             "correct": req.correct,
-            "correctedDecision": req.correctedDecision,
+            "correctedDecision": human_decision,
+            "action": action,
+            "note": req.note,
             "timestamp": timestamp
         })
         
@@ -1088,8 +2587,37 @@ def agent_feedback(req: FeedbackRequest):
             feedback_path.write_text(json.dumps(feedbacks, indent=2), encoding="utf-8")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to persist local feedback JSON: {e}")
-            
-    return {"status": "success", "neo4j": neo4j_success}
+
+    chroma_indexed = False
+    chroma = get_chroma_client()
+    if HAS_EMBEDDINGS and chroma:
+        try:
+            collection = chroma.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+            feedback_text = (
+                f"Maintainer correction for issue {req.issueId} in {repo_id}. "
+                f"AI decision: {req.decision}. Human action: {action}. "
+                f"Corrected decision: {human_decision}. Note: {req.note or 'none'}."
+            )
+            collection.upsert(
+                ids=[f"feedback:{repo_id}:{req.issueId}:{timestamp}"],
+                embeddings=[model.encode(feedback_text).tolist()],
+                metadatas=[{
+                    "repo": repo_id,
+                    "type": "maintainer_feedback",
+                    "source_id": issue_graph_id,
+                    "url": f"https://github.com/{repo_id}/issues/{req.issueId}",
+                    "date": timestamp,
+                    "updated_at": timestamp,
+                    "title": f"Maintainer correction for issue #{req.issueId}",
+                    "author": "maintainer",
+                }],
+                documents=[feedback_text],
+            )
+            chroma_indexed = True
+        except Exception as feedback_chroma_err:
+            print(f"Maintainer feedback Chroma indexing failed: {feedback_chroma_err}")
+
+    return {"status": "success", "neo4j": neo4j_success, "chroma": chroma_indexed, "action": action, "humanDecision": human_decision}
 
 if __name__ == "__main__":
     import uvicorn

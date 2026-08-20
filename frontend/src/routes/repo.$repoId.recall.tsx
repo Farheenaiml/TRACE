@@ -7,13 +7,13 @@ import { recallIssue, type RecallMatch } from "@/lib/mock-api";
 export const Route = createFileRoute("/repo/$repoId/recall")({
   head: () => ({
     meta: [
-      { title: "Issue recall — RepoMind" },
+      { title: "Issue recall — TRACE" },
       {
         name: "description",
         content:
           "Paste a new issue and surface similar past issues and decisions before you start work.",
       },
-      { property: "og:title", content: "Issue recall — RepoMind" },
+      { property: "og:title", content: "Issue recall — TRACE" },
       {
         property: "og:description",
         content: "Find past issues and decisions similar to a new report.",
@@ -55,7 +55,7 @@ function RecallView() {
       <section className="surface p-5 sm:p-6">
         <h1 className="text-lg font-semibold text-foreground">Issue recall</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Paste a new issue and RepoMind surfaces past issues and decisions that overlap with it.
+          Paste a new issue and TRACE surfaces past issues and decisions that overlap with it.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-5 flex flex-col gap-3">

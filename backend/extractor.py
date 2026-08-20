@@ -62,8 +62,10 @@ def extract_rationale(records: list[dict]) -> list[dict]:
             "source_url": r.get("url", "#"),
             "repo": r.get("repo", ""),
             "title": title,
+            "body": body,
             "author": r.get("author", "unknown"),
             "date": r.get("date") or r.get("updated_at", ""),
+            "updated_at": r.get("updated_at", ""),
             "has_rationale": len(rationale_sentences) > 0,
             "rationale_sentences": rationale_sentences,
         })

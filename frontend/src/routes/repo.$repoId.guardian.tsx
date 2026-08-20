@@ -11,6 +11,7 @@ import {
   AlertCircle,
   ThumbsUp,
   ThumbsDown,
+  MessageSquare,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -18,13 +19,13 @@ import { toast } from "sonner";
 export const Route = createFileRoute("/repo/$repoId/guardian")({
   head: () => ({
     meta: [
-      { title: "RepoGuardian Triage — RepoMind" },
+      { title: "RepoGuardian Triage — TRACE" },
       {
         name: "description",
         content:
           "Automated triage scanning, duplicate issue checking, and AI-powered escalation scoring.",
       },
-      { property: "og:title", content: "RepoGuardian Triage — RepoMind" },
+      { property: "og:title", content: "RepoGuardian Triage — TRACE" },
       {
         property: "og:description",
         content: "AI-driven triage scanning and GitHub issue prioritization.",
@@ -117,7 +118,7 @@ function GuardianView() {
 
   const [activeCorrectionId, setActiveCorrectionId] = useState<string | null>(null);
   const [feedbackStates, setFeedbackStates] = useState<
-    Record<string, { submitted: boolean; correct: boolean; correctedDecision?: string }>
+    Record<string, { submitted: boolean; correct: boolean; correctedDecision?: string | undefined }>
   >({});
 
   async function handleFeedback(
@@ -466,7 +467,7 @@ function GuardianView() {
                             </div>
                           ) : (
                             <span className="text-xs text-muted-foreground italic ml-2 inline-flex items-center gap-1">
-                              {feedbackStates[item.issue_id].correct ? (
+                              {feedbackStates[item.issue_id]?.correct ? (
                                 <>
                                   <ThumbsUp className="size-3 text-success fill-current" />
                                   Confirmed
@@ -476,7 +477,7 @@ function GuardianView() {
                                   <ThumbsDown className="size-3 text-destructive fill-current" />
                                   Corrected to{" "}
                                   {formatDecision(
-                                    feedbackStates[item.issue_id].correctedDecision || "",
+                                    feedbackStates[item.issue_id]?.correctedDecision || "",
                                   )}
                                 </>
                               )}

@@ -3,7 +3,9 @@ python-dotenv
 fastapi
 uvicorn
 neo4j
-qdrant-client
+chromadb
 sentence-transformers
 spacy
 APScheduler
+pydriller
+langgraph

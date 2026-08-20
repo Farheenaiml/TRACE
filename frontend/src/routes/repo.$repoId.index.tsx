@@ -2,20 +2,20 @@ import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { askQuestion, sampleQuestions, type Answer } from "@/lib/mock-api";
-import { QuestionInput } from "@/components/repomind/QuestionInput";
-import { AnswerPanel, AnswerSkeleton, AnswerEmptyState } from "@/components/repomind/AnswerPanel";
-import { RelatedDecisionsList } from "@/components/repomind/RelatedDecisionsList";
+import { QuestionInput } from "@/components/trace/QuestionInput";
+import { AnswerPanel, AnswerSkeleton, AnswerEmptyState } from "@/components/trace/AnswerPanel";
+import { RelatedDecisionsList } from "@/components/trace/RelatedDecisionsList";
 
 export const Route = createFileRoute("/repo/$repoId/")({
   head: () => ({
     meta: [
-      { title: "Ask your codebase — RepoMind" },
+      { title: "Ask your codebase — TRACE" },
       {
         name: "description",
         content:
           "Ask why a decision was made and get an answer with citations, confidence and related decisions.",
       },
-      { property: "og:title", content: "Ask your codebase — RepoMind" },
+      { property: "og:title", content: "Ask your codebase — TRACE" },
       {
         property: "og:description",
         content: "Evidence-grounded answers about past engineering decisions.",

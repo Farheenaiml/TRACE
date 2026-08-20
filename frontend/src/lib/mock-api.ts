@@ -264,7 +264,7 @@ export async function listRepos(): Promise<Repo[]> {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return await response.json();
   } catch {
-    return REPOS;
+    return [];
   }
 }
 
@@ -273,34 +273,65 @@ export async function getRepo(id: string): Promise<Repo | undefined> {
     const response = await fetch(`${API_BASE}/repos/${id}`);
     if (response.ok) return await response.json();
   } catch {
-    // Use local demo data when the backend is unavailable.
+    // Return undefined when backend is unavailable
   }
-  return REPOS.find((r) => r.id === id);
+  return undefined;
 }
 
 export function sampleQuestions(): string[] {
-  return SAMPLE_ANSWERS.map((a) => a.question);
+  return [];
 }
 
-export async function askQuestion(_repoId: string, question: string): Promise<Answer> {
-  await delay(1100);
-  const q = question.toLowerCase();
-  const hit = SAMPLE_ANSWERS.find((a) =>
-    a.question
-      .toLowerCase()
-      .split(/\W+/)
-      .filter((w) => w.length > 4)
-      .some((w) => q.includes(w)),
-  );
-  return { ...(hit ?? FALLBACK), question };
+export async function askQuestion(repoId: string, question: string): Promise<Answer> {
+  const response = await fetch(`${API_BASE}/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ repoId, question }),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return await response.json();
 }
 
 export async function recallIssue(
-  _repoId: string,
+  repoId: string,
   title: string,
-  _body: string,
+  body: string,
 ): Promise<RecallMatch[]> {
-  await delay(900);
-  if (!title.trim()) return [];
-  return RECALL_MATCHES;
+  try {
+    const response = await fetch(`${API_BASE}/recall`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ repoId, title, body }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    console.error("Failed to query recall backend:", error);
+    return [];
+  }
+}
+
+export async function ingestRepo(repoUrl: string): Promise<Repo> {
+  const response = await fetch(`${API_BASE}/repos/ingest`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ repoUrl }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: "Ingestion failed" }));
+    throw new Error(err.detail || `HTTP ${response.status}`);
+  }
+  return await response.json();
+}
+
+export async function getIngestStatus(repoId: string): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE}/repos/ingest/status/${repoId}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return await response.json();
 }

@@ -1,7 +1,7 @@
 import { createFileRoute, Link, Outlet, notFound } from "@tanstack/react-router";
 import { Brain, GitBranch, ChevronsUpDown } from "lucide-react";
 import { getRepo } from "@/lib/mock-api";
-import { ThemeToggle } from "@/components/repomind/ThemeToggle";
+import { ThemeToggle } from "@/components/trace/ThemeToggle";
 
 export const Route = createFileRoute("/repo/$repoId")({
   loader: async ({ params }) => {
@@ -21,7 +21,7 @@ function RepoLayout() {
         <div className="mx-auto flex w-full max-w-4xl items-center gap-3 px-5 py-4">
           <Link to="/" className="flex items-center gap-2 text-sm font-semibold text-foreground">
             <Brain className="size-4 text-primary" aria-hidden />
-            RepoMind
+            TRACE
           </Link>
           <span className="text-border">/</span>
           <Link
