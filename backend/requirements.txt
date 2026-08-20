@@ -1,0 +1,9 @@
+requests
+python-dotenv
+fastapi
+uvicorn
+neo4j
+qdrant-client
+sentence-transformers
+spacy
+APScheduler
