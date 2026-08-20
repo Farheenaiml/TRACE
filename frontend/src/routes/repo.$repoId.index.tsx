@@ -9,13 +9,13 @@ import { RelatedDecisionsList } from "@/components/trace/RelatedDecisionsList";
 export const Route = createFileRoute("/repo/$repoId/")({
   head: () => ({
     meta: [
-      { title: "Ask your codebase — RepoMind" },
+      { title: "Ask your codebase — TRACE" },
       {
         name: "description",
         content:
           "Ask why a decision was made and get an answer with citations, confidence and related decisions.",
       },
-      { property: "og:title", content: "Ask your codebase — RepoMind" },
+      { property: "og:title", content: "Ask your codebase — TRACE" },
       {
         property: "og:description",
         content: "Evidence-grounded answers about past engineering decisions.",
