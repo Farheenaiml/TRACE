@@ -27,13 +27,13 @@ import { Button } from "@/components/ui/button";
 export const Route = createFileRoute("/repo/$repoId/health")({
   head: () => ({
     meta: [
-      { title: "Project Health Analysis — RepoMind" },
+      { title: "Project Health Analysis — TRACE" },
       {
         name: "description",
         content:
           "Track repository health, backlog growth, duplicate rates, and contributor activity trends.",
       },
-      { property: "og:title", content: "Project Health Analysis — RepoMind" },
+      { property: "og:title", content: "Project Health Analysis — TRACE" },
       { property: "og:description", content: "Repository health analytics and backlog trends." },
     ],
   }),
@@ -133,6 +133,7 @@ function trendIcon(trend: string | null) {
 
 function HealthView() {
   const { repoId } = Route.useParams();
+  const decodedRepoId = decodeURIComponent(repoId);
   const [loading, setLoading] = useState(true);
   const [health, setHealth] = useState<HealthData | null>(null);
   const [brief, setBrief] = useState<BriefData | null>(null);
@@ -142,7 +143,7 @@ function HealthView() {
     async function loadHealth() {
       setLoading(true);
       try {
-        const res = await fetch(`${API_BASE}/health?repoId=${encodeURIComponent(repoId)}`);
+        const res = await fetch(`${API_BASE}/health?repoId=${encodeURIComponent(decodedRepoId)}`);
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }
@@ -162,7 +163,7 @@ function HealthView() {
   async function loadBrief() {
     setBriefLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/brief?repoId=${encodeURIComponent(repoId)}`);
+      const res = await fetch(`${API_BASE}/brief?repoId=${encodeURIComponent(decodedRepoId)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: BriefData = await res.json();
       setBrief(data);

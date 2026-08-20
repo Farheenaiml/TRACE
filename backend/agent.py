@@ -272,42 +272,8 @@ def score_escalation(issue: dict, duplicates: list[dict]) -> dict:
     if feedback_str:
         user_prompt += f"\n\nMaintainer Feedback on Similar Past Issues:\n{feedback_str}"
 
-    res_dict = None
-    if GROQ_API_KEY:
-        try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.2,
-                },
-                timeout=15,
-            )
-            res.raise_for_status()
-            res_dict = json.loads(res.json()["choices"][0]["message"]["content"])
-        except Exception as e:
-            print(f"Groq escalation scoring failed, trying Ollama: {e}")
-
-    if res_dict is None:
-        try:
-            res = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": "llama3.2",
-                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                    "format": "json",
-                    "stream": False,
-                    "options": {"temperature": 0.2},
-                },
-                timeout=20,
-            )
-            res.raise_for_status()
-            res_dict = json.loads(res.json()["message"]["content"])
-        except Exception as e:
-            print(f"Ollama escalation scoring failed or unavailable: {e}")
+    from llm import call_llm_json
+    res_dict = call_llm_json(system_prompt, user_prompt, temperature=0.2)
 
     if res_dict is None:
         # Deterministic fallback — keeps the demo alive if both LLMs are down
@@ -390,19 +356,5 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# FastAPI route to paste into main.py — add this near the other @app routes,
-# and add `from agent import run_scan` near the top of main.py.
+# End of file
 # ---------------------------------------------------------------------------
-#
-# @app.post("/agent/scan")
-# def agent_scan(repoId: str):
-#     import json
-#     from pathlib import Path
-#     issues_path = Path(__file__).resolve().parent.parent / "data" / "raw" / f"{repoId.split('/')[-1]}_issues.json"
-#     if not issues_path.exists():
-#         raise HTTPException(status_code=404, detail=f"No ingested issues found for {repoId}. Run ingest.py --issues first.")
-#     issues = json.loads(issues_path.read_text(encoding="utf-8"))
-#     issues = [i for i in issues if i["type"] == "issue"]
-#     from agent import run_scan
-#     results = run_scan(issues)
-#     return {"repoId": repoId, "scanned": len(results), "results": results}

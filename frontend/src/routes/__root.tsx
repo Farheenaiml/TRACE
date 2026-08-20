@@ -74,14 +74,14 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "RepoMind — Decision intelligence for software teams" },
+      { title: "TRACE — Decision intelligence for your codebase" },
       {
         name: "description",
         content:
           "Ask why past decisions were made in your codebase and get evidence-grounded answers.",
       },
-      { property: "og:title", content: "RepoMind" },
-      { property: "og:description", content: "Decision intelligence for software teams." },
+      { property: "og:title", content: "TRACE" },
+      { property: "og:description", content: "Decision intelligence for your codebase." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],

@@ -47,6 +47,12 @@ def get_node_label(source_type: str) -> str:
         return "Issue"
     elif st in ("pull_request", "pr"):
         return "PullRequest"
+    elif st == "discussion":
+        return "Discussion"
+    elif st == "source_file":
+        return "SourceFile"
+    elif st == "documentation":
+        return "Documentation"
     return "Commit"
 
 

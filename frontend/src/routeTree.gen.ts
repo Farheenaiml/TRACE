@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as RepoRepoIdRouteImport } from './routes/repo.$repoId'
+import { Route as ReposNewRouteImport } from './routes/repos.new'
 import { Route as RepoRepoIdIndexRouteImport } from './routes/repo.$repoId.index'
 import { Route as RepoRepoIdGuardianRouteImport } from './routes/repo.$repoId.guardian'
 import { Route as RepoRepoIdHealthRouteImport } from './routes/repo.$repoId.health'
@@ -24,6 +25,11 @@ const IndexRoute = IndexRouteImport.update({
 const RepoRepoIdRoute = RepoRepoIdRouteImport.update({
   id: '/repo/$repoId',
   path: '/repo/$repoId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ReposNewRoute = ReposNewRouteImport.update({
+  id: '/repos/new',
+  path: '/repos/new',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RepoRepoIdIndexRoute = RepoRepoIdIndexRouteImport.update({
@@ -50,6 +56,7 @@ const RepoRepoIdRecallRoute = RepoRepoIdRecallRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/repo/$repoId': typeof RepoRepoIdRouteWithChildren
+  '/repos/new': typeof ReposNewRoute
   '/repo/$repoId/guardian': typeof RepoRepoIdGuardianRoute
   '/repo/$repoId/health': typeof RepoRepoIdHealthRoute
   '/repo/$repoId/recall': typeof RepoRepoIdRecallRoute
@@ -57,6 +64,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/repos/new': typeof ReposNewRoute
   '/repo/$repoId/guardian': typeof RepoRepoIdGuardianRoute
   '/repo/$repoId/health': typeof RepoRepoIdHealthRoute
   '/repo/$repoId/recall': typeof RepoRepoIdRecallRoute
@@ -66,6 +74,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/repo/$repoId': typeof RepoRepoIdRouteWithChildren
+  '/repos/new': typeof ReposNewRoute
   '/repo/$repoId/guardian': typeof RepoRepoIdGuardianRoute
   '/repo/$repoId/health': typeof RepoRepoIdHealthRoute
   '/repo/$repoId/recall': typeof RepoRepoIdRecallRoute
@@ -76,6 +85,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/repo/$repoId'
+    | '/repos/new'
     | '/repo/$repoId/guardian'
     | '/repo/$repoId/health'
     | '/repo/$repoId/recall'
@@ -83,6 +93,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/repos/new'
     | '/repo/$repoId/guardian'
     | '/repo/$repoId/health'
     | '/repo/$repoId/recall'
@@ -91,6 +102,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/repo/$repoId'
+    | '/repos/new'
     | '/repo/$repoId/guardian'
     | '/repo/$repoId/health'
     | '/repo/$repoId/recall'
@@ -100,6 +112,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   RepoRepoIdRoute: typeof RepoRepoIdRouteWithChildren
+  ReposNewRoute: typeof ReposNewRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -116,6 +129,13 @@ declare module '@tanstack/react-router' {
       path: '/repo/$repoId'
       fullPath: '/repo/$repoId'
       preLoaderRoute: typeof RepoRepoIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/repos/new': {
+      id: '/repos/new'
+      path: '/repos/new'
+      fullPath: '/repos/new'
+      preLoaderRoute: typeof ReposNewRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/repo/$repoId/': {
@@ -170,6 +190,7 @@ const RepoRepoIdRouteWithChildren = RepoRepoIdRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   RepoRepoIdRoute: RepoRepoIdRouteWithChildren,
+  ReposNewRoute: ReposNewRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

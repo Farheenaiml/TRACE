@@ -2,9 +2,9 @@ import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { askQuestion, sampleQuestions, type Answer } from "@/lib/mock-api";
-import { QuestionInput } from "@/components/repomind/QuestionInput";
-import { AnswerPanel, AnswerSkeleton, AnswerEmptyState } from "@/components/repomind/AnswerPanel";
-import { RelatedDecisionsList } from "@/components/repomind/RelatedDecisionsList";
+import { QuestionInput } from "@/components/trace/QuestionInput";
+import { AnswerPanel, AnswerSkeleton, AnswerEmptyState } from "@/components/trace/AnswerPanel";
+import { RelatedDecisionsList } from "@/components/trace/RelatedDecisionsList";
 
 export const Route = createFileRoute("/repo/$repoId/")({
   head: () => ({
@@ -28,13 +28,14 @@ export const Route = createFileRoute("/repo/$repoId/")({
 
 function Dashboard() {
   const { repoId } = Route.useParams();
+  const decodedRepoId = decodeURIComponent(repoId);
   const [loading, setLoading] = useState(false);
   const [answer, setAnswer] = useState<Answer | null>(null);
 
   async function handleAsk(question: string) {
     setLoading(true);
     setAnswer(null);
-    const result = await askQuestion(repoId, question);
+    const result = await askQuestion(decodedRepoId, question);
     setAnswer(result);
     setLoading(false);
   }

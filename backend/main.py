@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -39,6 +39,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_API_BASE = "https://api.github.com"
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
+
+REPO_STATUSES = {}
 
 
 def github_get(path: str, params: Optional[dict] = None):
@@ -167,6 +169,9 @@ def get_neo4j_driver():
         return None
 
 # Schemas
+class AddRepoRequest(BaseModel):
+    repoUrl: str
+
 class QueryRequest(BaseModel):
     repoId: str
     question: str
@@ -219,122 +224,9 @@ class FeedbackRequest(BaseModel):
     correctedDecision: Optional[str] = None
 
 # Mock Data
-MOCK_REPOS = [
-    {
-        "id": "auth-service",
-        "name": "auth-service",
-        "description": "Identity, sessions and token issuance for the platform.",
-        "language": "TypeScript",
-        "decisions": 218,
-    },
-    {
-        "id": "minihooked",
-        "name": "MiniHooked",
-        "description": "Lightweight React hooks toolkit used across product teams.",
-        "language": "TypeScript",
-        "decisions": 94,
-    },
-    {
-        "id": "casesense",
-        "name": "CaseSense",
-        "description": "Case-management engine with a rules DSL and audit trail.",
-        "language": "Python",
-        "decisions": 341,
-    },
-]
-
-MOCK_ANSWERS = [
-    {
-        "question": "Why was OAuth chosen over JWT in the auth module?",
-        "answer": "OAuth 2.0 was adopted as the authorization framework in Q2 2024 after the team hit revocation limits with self-issued JWTs. The discussion in PR #142 concluded that stateless JWTs made instant session revocation impossible without a deny-list, which would have reintroduced a shared datastore anyway. OAuth with short-lived access tokens plus refresh-token rotation gave the security team a revocation path and let the mobile clients reuse the provider's consent screen. JWT was not removed entirely — it remains the wire format for the access tokens themselves.",
-        "confidence": "high",
-        "citations": [
-            {"id": "c1", "label": "commit a3f21c", "kind": "commit", "url": "#"},
-            {"id": "c2", "label": "PR #142", "kind": "pr", "url": "#"},
-            {"id": "c3", "label": "ADR-011 Token strategy", "kind": "doc", "url": "#"},
-            {"id": "c4", "label": "issue #98", "kind": "issue", "url": "#"},
-        ],
-        "contradiction": "This may conflict with a past decision: commit a3f21c removed the basic-auth fallback for security reasons, so any OAuth outage path must not re-enable it.",
-        "related": [
-            {"id": "d1", "title": "Adopted refresh-token rotation for mobile clients", "when": "3 months ago", "author": "@rin"},
-            {"id": "d2", "title": "Dropped basic-auth fallback from the gateway", "when": "7 months ago", "author": "@marcus"},
-            {"id": "d3", "title": "Moved session store from Redis to Postgres", "when": "9 months ago", "author": "@aditi"},
-            {"id": "d4", "title": "Standardised on 15-minute access token TTL", "when": "1 year ago", "author": "@rin"},
-        ],
-    },
-    {
-        "question": "Why do we still ship a custom useDebounce instead of a library?",
-        "answer": "The team evaluated three third-party debounce hooks in early 2025 and kept the in-house implementation. The deciding factor was bundle weight: the candidates pulled in lodash-style scheduling helpers that added ~4kb gzipped for behaviour the internal version covers in 22 lines. A secondary concern raised in issue #61 was that external hooks flushed pending calls on unmount, which broke the search-as-you-type analytics contract.",
-        "confidence": "medium",
-        "citations": [
-            {"id": "c5", "label": "commit 7b19de", "kind": "commit", "url": "#"},
-            {"id": "c6", "label": "issue #61", "kind": "issue", "url": "#"},
-            {"id": "c7", "label": "PR #77", "kind": "pr", "url": "#"},
-        ],
-        "related": [
-            {"id": "d5", "title": "Set a 12kb budget for the hooks bundle", "when": "5 months ago", "author": "@lena"},
-            {"id": "d6", "title": "Rejected lodash as a runtime dependency", "when": "8 months ago", "author": "@marcus"},
-            {"id": "d7", "title": "Added flush-on-unmount opt-in to useDebounce", "when": "10 months ago", "author": "@lena"},
-        ],
-    },
-    {
-        "question": "Why is the rules engine evaluated server-side only?",
-        "answer": "Server-side evaluation was chosen so the rule set never leaves the audit boundary. Compliance review in 2024 flagged that shipping the DSL to the browser would expose scoring thresholds that clients are contractually not allowed to see. The team accepted the extra round-trip latency (~80ms p95) and added an optimistic UI layer instead. A partial client-side validator exists, but it only checks syntax, never outcomes.",
-        "confidence": "high",
-        "citations": [
-            {"id": "c8", "label": "commit f04a11", "kind": "commit", "url": "#"},
-            {"id": "c9", "label": "ADR-004 Rule evaluation", "kind": "doc", "url": "#"},
-        ],
-        "related": [
-            {"id": "d8", "title": "Added optimistic UI for rule previews", "when": "2 months ago", "author": "@aditi"},
-            {"id": "d9", "title": "Split syntax validation out of the evaluator", "when": "6 months ago", "author": "@jonas"},
-            {"id": "d10", "title": "Introduced immutable audit log for rule runs", "when": "1 year ago", "author": "@aditi"},
-        ],
-    },
-]
-
-MOCK_RECALLS = [
-    {
-        "id": "r1",
-        "title": "Login loop after token refresh on Safari",
-        "summary": "Same symptom class: refresh token rejected because the cookie SameSite attribute was dropped by the proxy. Fixed by pinning SameSite=None; Secure at the gateway.",
-        "similarity": 0.93,
-        "when": "4 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r2",
-        "title": "Intermittent 401s during deploy windows",
-        "summary": "Signing keys were rotated before the old key left the JWKS cache. The rollout order was changed so keys publish one deploy ahead of use.",
-        "similarity": 0.81,
-        "when": "7 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r3",
-        "title": "ADR-011: token strategy and revocation",
-        "summary": "Decision record explaining short-lived access tokens plus rotation, which constrains any fix that lengthens session lifetime.",
-        "similarity": 0.74,
-        "when": "1 year ago",
-        "status": "merged",
-    },
-    {
-        "id": "r4",
-        "title": "Session store migration caused duplicate sessions",
-        "summary": "During the Redis to Postgres cutover, dual writes produced two live sessions per user. Related if the report mentions duplicate devices.",
-        "similarity": 0.62,
-        "when": "9 months ago",
-        "status": "closed",
-    },
-    {
-        "id": "r5",
-        "title": "Rate limiter counts refresh calls as logins",
-        "summary": "Open issue with overlapping vocabulary; may be the same root cause if the user is being throttled.",
-        "similarity": 0.48,
-        "when": "3 weeks ago",
-        "status": "open",
-    },
-]
+MOCK_REPOS = []
+MOCK_ANSWERS = []
+MOCK_RECALLS = []
 
 def check_db_empty_for_repo(repo_id: str) -> bool:
     driver = get_neo4j_driver()
@@ -376,7 +268,7 @@ def search_neo4j_keywords(repo_id: str, text: str, limit: int = 5) -> list:
         with driver.session() as session:
             cypher = """
             MATCH (c {repo: $repo_id})-[:HAS_RATIONALE]->(rat:Rationale)
-            WHERE c:Commit OR c:Issue OR c:PullRequest
+            WHERE c:Commit OR c:Issue OR c:PullRequest OR c:Discussion OR c:SourceFile OR c:Documentation
             WITH c, rat, 
                  [kw IN $keywords WHERE toLower(rat.text) CONTAINS kw] AS matches
             WHERE size(matches) > 0
@@ -413,6 +305,12 @@ def format_source_label(c: dict) -> str:
         return f"Issue [#{display_id}]"
     elif stype in ("pull_request", "pr"):
         return f"PR [#{display_id}]"
+    elif stype == "discussion":
+        return f"Discussion [#{display_id}]"
+    elif stype == "source_file":
+        return f"File [{display_id}]"
+    elif stype == "documentation":
+        return f"Doc [{display_id}]"
     return f"Commit [{display_id}]"
 
 # Generate synthesized LLM answer
@@ -436,49 +334,10 @@ def call_llm(question: str, context_sentences: List[dict]) -> dict:
     
     user_prompt = f"Context:\n{context_str}\n\nQuestion: {question}"
 
-    # Try Groq first
-    if GROQ_API_KEY:
-        print("Synthesizing answer using Groq...")
-        try:
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2
-            }
-            res = requests.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=15)
-            res.raise_for_status()
-            content = res.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
-        except Exception as e:
-            print(f"Groq generation failed, attempting Ollama fallback: {e}")
-
-    # Try local Ollama fallback
-    try:
-        print("Synthesizing answer using Ollama...")
-        payload = {
-            "model": "llama3.2",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "format": "json",
-            "stream": False,
-            "options": {"temperature": 0.2}
-        }
-        res = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=20)
-        res.raise_for_status()
-        content = res.json()["message"]["content"]
-        return json.loads(content)
-    except Exception as e:
-        print(f"Ollama generation failed or unavailable: {e}")
+    from llm import call_llm_json
+    res_dict = call_llm_json(system_prompt, user_prompt, temperature=0.2)
+    if res_dict is not None:
+        return res_dict
 
     # Local Rule-based template fallback
     print("Running local deterministic fallback synthesis...")
@@ -496,51 +355,162 @@ def call_llm(question: str, context_sentences: List[dict]) -> dict:
 
 # Endpoints
 
+def get_status_file_path(repo_id: str) -> Path:
+    repo_slug = repo_id.split('/')[-1]
+    raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+    return raw_dir / f"{repo_slug}_ingest_status.json"
+
+def write_ingest_status(repo_id: str, status: str, step: str, error: str = None):
+    data = {
+        "repo_id": repo_id,
+        "status": status,
+        "step": step,
+        "error": error
+    }
+    REPO_STATUSES[repo_id] = data
+    try:
+        path = get_status_file_path(repo_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"Error writing ingest status for {repo_id}: {e}")
+
+def read_ingest_status(repo_id: str) -> dict:
+    if repo_id in REPO_STATUSES:
+        return REPO_STATUSES[repo_id]
+        
+    path = get_status_file_path(repo_id)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            REPO_STATUSES[repo_id] = data
+            return data
+        except Exception as e:
+            print(f"Error reading ingest status for {repo_id}: {e}")
+            
+    repo_slug = repo_id.split('/')[-1]
+    raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+    issues_path = raw_dir / f"{repo_slug}_issues.json"
+    if issues_path.exists():
+        data = {
+            "repo_id": repo_id,
+            "status": "ready",
+            "step": "done",
+            "error": None
+        }
+        REPO_STATUSES[repo_id] = data
+        return data
+        
+    return {
+        "repo_id": repo_id,
+        "status": "failed",
+        "step": "not_started",
+        "error": f"Repository '{repo_id}' has not been added yet."
+    }
+
+def get_ready_persisted_repos() -> list[dict]:
+    ready_repos = []
+    raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+    if raw_dir.exists():
+        for path in raw_dir.glob("*_ingest_status.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("status") == "ready":
+                    repo_id = data.get("repo_id")
+                    if repo_id and "/" in repo_id:
+                        repo_slug = repo_id.split('/')[-1]
+                        ready_repos.append({
+                            "id": repo_id,
+                            "name": repo_slug,
+                            "description": "Ready (local cache)",
+                            "language": "Unknown",
+                            "decisions": 0
+                        })
+            except Exception:
+                pass
+    return ready_repos
+
 @app.get("/repos", response_model=List[RepoResponse])
 def list_repositories():
+    db_repos = []
+    driver = None
+    if NEO4J_PASSWORD:
+        try:
+            driver = get_neo4j_driver()
+        except Exception as e:
+            print(f"Neo4j driver load skipped/failed: {e}")
+            driver = None
+    if driver is not None:
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (r:Repository)
+                    OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
+                    OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
+                    RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
+                    """
+                )
+                for record in result:
+                    db_repos.append({
+                        "id": record["id"],
+                        "name": record["name"] or record["id"].split('/')[-1],
+                        "description": record["description"] or "Imported from GitHub",
+                        "language": record["language"] or "Unknown",
+                        "decisions": record["decisions"] or 0
+                    })
+        except Exception as e:
+            print(f"Error querying Neo4j for repos: {e}")
+        finally:
+            driver.close()
+
+    # Get active/ready persisted and in-memory repos
+    statuses_repos = get_ready_persisted_repos()
+    for r_id, info in list(REPO_STATUSES.items()):
+        if info.get("status") == "ready":
+            if not any(r["id"] == r_id for r in db_repos) and not any(r["id"] == r_id for r in statuses_repos):
+                repo_slug = r_id.split('/')[-1]
+                statuses_repos.append({
+                    "id": r_id,
+                    "name": repo_slug,
+                    "description": "Ready (local cache)",
+                    "language": "Unknown",
+                    "decisions": 0
+                })
+
+    # Retrieve GitHub repos if token is set
+    gh_repos = []
     if GITHUB_TOKEN:
         repos = github_get("/user/repos", {"per_page": 100, "sort": "updated", "affiliation": "owner,collaborator,organization_member"})
         if repos is not None:
-            return [github_repo_response(repo) for repo in repos]
+            temp_repos = [github_repo_response(repo) for repo in repos]
+            for r in temp_repos:
+                status_info = read_ingest_status(r["id"])
+                if status_info["status"] == "ready":
+                    gh_repos.append(r)
 
-    driver = get_neo4j_driver()
-    if driver is None:
-        return MOCK_REPOS
+    # Combine lists
+    all_repos = []
+    seen_ids = set()
 
-    try:
-        with driver.session() as session:
-            result = session.run(
-                """
-                MATCH (r:Repository)
-                OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
-                OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
-                RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
-                """
-            )
-            repos = []
-            for record in result:
-                repos.append({
-                    "id": record["id"],
-                    "name": record["name"],
-                    "description": record["description"],
-                    "language": record["language"],
-                    "decisions": record["decisions"]
-                })
-            
-            if not repos:
-                return MOCK_REPOS
-            
-            # Ensure mock repos are accessible in the UI
-            for mock_r in MOCK_REPOS:
-                if not any(r["id"] == mock_r["id"] for r in repos):
-                    repos.append(mock_r)
+    for r in db_repos:
+        if r["id"] not in seen_ids:
+            all_repos.append(r)
+            seen_ids.add(r["id"])
 
-            return repos
-    except Exception as e:
-        print(f"Error querying Neo4j for repos: {e}")
-        return MOCK_REPOS
-    finally:
-        driver.close()
+    for r in statuses_repos:
+        if r["id"] not in seen_ids:
+            all_repos.append(r)
+            seen_ids.add(r["id"])
+
+    for r in gh_repos:
+        if r["id"] not in seen_ids:
+            all_repos.append(r)
+            seen_ids.add(r["id"])
+
+    # Ensure mock/demo repos are always available as fallback - REMOVED
+
+    return all_repos
 
 @app.get("/repos/{repo_id:path}", response_model=RepoResponse)
 def get_repository(repo_id: str):
@@ -576,73 +546,15 @@ def get_repository(repo_id: str):
         finally:
             driver.close()
 
-    mock_r = next((r for r in MOCK_REPOS if r["id"] == repo_id), None)
-    if mock_r:
-        return mock_r
+
 
     raise HTTPException(status_code=404, detail="Repository not found")
 
 @app.post("/query", response_model=AnswerResponse)
 def query_decision(req: QueryRequest):
-    if GITHUB_TOKEN and req.repoId.count("/") == 1:
-        commits = github_get(f"/repos/{req.repoId}/commits", {"per_page": 20}) or []
-        words = {word for word in req.question.lower().split() if len(word) > 4}
-        relevant = [
-            commit for commit in commits
-            if words.intersection(set(commit["commit"]["message"].lower().split()))
-        ] or commits[:5]
-        if relevant:
-            citations = []
-            related = []
-            for commit in relevant[:5]:
-                sha = commit["sha"]
-                message = commit["commit"]["message"].split("\n", 1)[0]
-                author = commit["author"]["login"] if commit.get("author") else commit["commit"]["author"]["name"]
-                citations.append({"id": sha[:8], "label": f"commit {sha[:7]}", "kind": "commit", "url": commit["html_url"]})
-                related.append({"id": sha[:8], "title": message, "when": format_when(commit["commit"]["author"]["date"]), "author": f"@{author}"})
-            return {
-                "question": req.question,
-                "answer": "Recent GitHub history for this repository does not contain a dedicated decision record for this question. The closest commit evidence is: " + "; ".join(c["commit"]["message"].split("\n", 1)[0] for c in relevant[:5]),
-                "confidence": "medium" if len(relevant) > 1 else "low",
-                "citations": citations,
-                "related": related,
-            }
 
-    is_mock = any(req.repoId == r["id"] for r in MOCK_REPOS)
-    is_empty = check_db_empty_for_repo(req.repoId)
 
-    if is_mock and is_empty:
-        q_lower = req.question.lower()
-        hit = None
-        for a in MOCK_ANSWERS:
-            keywords = [w for w in a["question"].lower().split() if len(w) > 4]
-            if any(kw in q_lower for kw in keywords):
-                hit = a
-                break
-        
-        if hit:
-            return {
-                "question": req.question,
-                "answer": hit["answer"],
-                "confidence": hit["confidence"],
-                "citations": [Citation(**c) for c in hit["citations"]],
-                "contradiction": hit.get("contradiction"),
-                "related": [Decision(**d) for d in hit["related"]]
-            }
-        
-        return {
-            "question": req.question,
-            "answer": "Based on the indexed history for this repository, there is no decision record matching this query in the static mocks.",
-            "confidence": "low",
-            "citations": [
-                {"id": "cf1", "label": "commit 91cc02", "kind": "commit", "url": "#"},
-                {"id": "cf2", "label": "PR #205", "kind": "pr", "url": "#"}
-            ],
-            "related": [
-                {"id": "df1", "title": "Review comments migrated into ADR format", "when": "4 months ago", "author": "@jonas"},
-                {"id": "df2", "title": "Backfilled decision index for legacy commits", "when": "11 months ago", "author": "@rin"}
-            ]
-        }
+
 
     # Retrieve context
     search_res = []
@@ -796,11 +708,7 @@ def query_decision(req: QueryRequest):
 
 @app.post("/recall", response_model=List[RecallMatchResponse])
 def recall_issue(req: RecallRequest):
-    is_mock = any(req.repoId == r["id"] for r in MOCK_REPOS)
-    is_empty = check_db_empty_for_repo(req.repoId)
-    
-    if is_mock and is_empty:
-        return MOCK_RECALLS
+
 
     search_res = []
     
@@ -987,25 +895,11 @@ def get_health(repoId: str):
     raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
     issues_path = raw_dir / f"{repo_slug}_issues.json"
 
-    is_mock = any(repoId == r["id"] for r in MOCK_REPOS)
-    
-    if not issues_path.exists() or (is_mock and check_db_empty_for_repo(repoId)):
-        return {
-            "repoId": repoId,
-            "open_issue_count": 14,
-            "backlog_growth_rate": 5.2,
-            "duplicate_rate": 18.5,
-            "active_contributor_count": 8,
-            "security_flag_count": 2,
-            "avg_response_time_hours": 12.4,
-            "response_time_label": "Time to last activity (proxy for maintainer response time)",
-            "history": [
-                {"timestamp": "2026-08-01T00:00:00Z", "open_issue_count": 10},
-                {"timestamp": "2026-08-08T00:00:00Z", "open_issue_count": 12},
-                {"timestamp": "2026-08-15T00:00:00Z", "open_issue_count": 13},
-                {"timestamp": "2026-08-20T00:00:00Z", "open_issue_count": 14}
-            ]
-        }
+    if not issues_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Repository health data not found for '{repoId}'. Run ingestion first."
+        )
 
     return compute_health(repoId)
 
@@ -1090,6 +984,225 @@ def agent_feedback(req: FeedbackRequest):
             raise HTTPException(status_code=500, detail=f"Failed to persist local feedback JSON: {e}")
             
     return {"status": "success", "neo4j": neo4j_success}
+
+import re
+
+def parse_github_repo(url_or_shorthand: str) -> tuple[str, str]:
+    s = url_or_shorthand.strip()
+    s = re.sub(r'^(https?://|git://|git\+ssh://|git@)', '', s)
+    s = re.sub(r'^github\.com[:/]', '', s)
+    s = re.sub(r'\.git$', '', s)
+    s = s.strip('/')
+    
+    match = re.match(r'^([a-zA-Z0-9\-\_\.]+)/([a-zA-Z0-9\-\_\.]+)$', s)
+    if not match:
+        raise ValueError("Invalid repository format. Expected 'owner/repo' or a GitHub URL.")
+    
+    owner, repo = match.groups()
+    return owner, repo
+
+def run_ingestion_pipeline(owner: str, repo: str, repo_id: str, repo_name: str, description: str, language: str):
+    try:
+        # Start: Metadata & Commits fetching
+        write_ingest_status(repo_id, "ingesting", "fetching_commits")
+        
+        # 1. Fetch metadata first to get default branch
+        from ingest import (
+            fetch_repo_metadata,
+            fetch_commits,
+            fetch_pull_requests,
+            fetch_issues,
+            fetch_discussions,
+            fetch_source_files,
+            fetch_documentation
+        )
+        metadata = fetch_repo_metadata(owner, repo)
+        default_branch = metadata.get("default_branch", "main")
+        
+        # Update repo details from GitHub
+        repo_name = metadata.get("name", repo_name)
+        description = metadata.get("description") or description
+        language = metadata.get("primary_language") or language
+        
+        commits = fetch_commits(owner, repo, limit=50)
+        
+        # Next: Issues & PRs
+        write_ingest_status(repo_id, "ingesting", "fetching_issues")
+        prs = fetch_pull_requests(owner, repo, limit=50)
+        issues = fetch_issues(owner, repo, commits, prs, limit=100)
+        
+        combined_issues = prs + issues
+        
+        discussions = fetch_discussions(owner, repo)
+        source_files = fetch_source_files(owner, repo, default_branch)
+        docs = fetch_documentation(owner, repo, default_branch)
+        
+        # Next: Rationale extraction
+        write_ingest_status(repo_id, "ingesting", "extracting_rationale")
+        raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        
+        commits_path = raw_dir / f"{repo}_commits.json"
+        issues_path = raw_dir / f"{repo}_issues.json"
+        discussions_path = raw_dir / f"{repo}_discussions.json"
+        code_path = raw_dir / f"{repo}_code.json"
+        docs_path = raw_dir / f"{repo}_docs.json"
+        
+        commits_path.write_text(json.dumps(commits, indent=2, ensure_ascii=False), encoding="utf-8")
+        issues_path.write_text(json.dumps(combined_issues, indent=2, ensure_ascii=False), encoding="utf-8")
+        discussions_path.write_text(json.dumps(discussions, indent=2, ensure_ascii=False), encoding="utf-8")
+        code_path.write_text(json.dumps(source_files, indent=2, ensure_ascii=False), encoding="utf-8")
+        docs_path.write_text(json.dumps(docs, indent=2, ensure_ascii=False), encoding="utf-8")
+        
+        from extractor import extract_rationale
+        extracted_commits = extract_rationale(commits)
+        extracted_issues = extract_rationale(combined_issues)
+        extracted_discussions = extract_rationale(discussions)
+        extracted_code = extract_rationale(source_files)
+        extracted_docs = extract_rationale(docs)
+        
+        # Next: Building Graph
+        write_ingest_status(repo_id, "ingesting", "building_graph")
+        driver = get_neo4j_driver()
+        if driver is not None:
+            try:
+                from graph_store import write_to_neo4j
+                write_to_neo4j(driver, extracted_commits)
+                write_to_neo4j(driver, extracted_issues)
+                write_to_neo4j(driver, extracted_discussions)
+                write_to_neo4j(driver, extracted_code)
+                write_to_neo4j(driver, extracted_docs)
+                
+                # Merge Repository node and link
+                with driver.session() as session:
+                    session.run(
+                        """
+                        MERGE (r:Repository {id: $repo_id})
+                        SET r.name = $repo_name,
+                            r.description = $description,
+                            r.language = $language
+                        """,
+                        repo_id=repo_id,
+                        repo_name=repo_name,
+                        description=description,
+                        language=language
+                    )
+                    session.run(
+                        """
+                        MATCH (c {repo: $repo_id})
+                        WHERE c:Commit OR c:Issue OR c:PullRequest OR c:Discussion OR c:SourceFile OR c:Documentation
+                        MATCH (r:Repository {id: $repo_id})
+                        MERGE (c)-[:BELONGS_TO]->(r)
+                        """,
+                        repo_id=repo_id
+                    )
+            except Exception as e:
+                print(f"Warning: Neo4j write failed: {e}")
+            finally:
+                driver.close()
+                
+        # Next: Embedding Qdrant
+        write_ingest_status(repo_id, "ingesting", "embedding")
+        qdrant = get_qdrant_client()
+        if qdrant is not None and HAS_EMBEDDINGS and model:
+            try:
+                from graph_store import write_to_qdrant
+                write_to_qdrant(qdrant, model, extracted_commits)
+                write_to_qdrant(qdrant, model, extracted_issues)
+                write_to_qdrant(qdrant, model, extracted_discussions)
+                write_to_qdrant(qdrant, model, extracted_code)
+                write_to_qdrant(qdrant, model, extracted_docs)
+            except Exception as e:
+                print(f"Warning: Qdrant write failed: {e}")
+                
+        # Running automated triage scan
+        triage_issues = [i for i in issues if i.get("type") == "issue"]
+        run_repo_scan(repo, repo_id, triage_issues)
+        
+        # Done!
+        write_ingest_status(repo_id, "ready", "done")
+    except Exception as e:
+        print(f"Ingestion pipeline failed for {repo_id}: {e}")
+        write_ingest_status(repo_id, "failed", "failed", error=str(e))
+
+@app.post("/repos/add")
+def add_repository_endpoint(req: AddRepoRequest, background_tasks: BackgroundTasks):
+    try:
+        owner, repo = parse_github_repo(req.repoUrl)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    repo_id = f"{owner}/{repo}"
+    
+    # Check if already ready or currently ingesting via read_ingest_status helper
+    status_info = read_ingest_status(repo_id)
+    if status_info["status"] in ("ingesting", "ready"):
+        return {"repoId": repo_id, "status": status_info["status"]}
+        
+    # Pre-flight check with GitHub API
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        
+    verify_url = f"https://api.github.com/repos/{owner}/{repo}"
+    try:
+        res = requests.get(verify_url, headers=headers, timeout=10)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to connect to GitHub API: {e}")
+        
+    if res.status_code == 404:
+        raise HTTPException(status_code=400, detail=f"Repository '{owner}/{repo}' not found or is private/inaccessible.")
+    elif res.status_code == 403:
+        remaining = res.headers.get("X-RateLimit-Remaining")
+        if remaining == "0":
+            raise HTTPException(status_code=400, detail="GitHub API rate limit exceeded. Please try again later.")
+        else:
+            raise HTTPException(status_code=400, detail="Access denied by GitHub (403).")
+    elif res.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"GitHub returned HTTP {res.status_code} during validation.")
+        
+    repo_details = res.json()
+    repo_name = repo_details.get("name", repo)
+    description = repo_details.get("description") or "Imported from GitHub"
+    language = repo_details.get("language") or "Unknown"
+    
+    # Initialize status in memory and persist to file
+    write_ingest_status(repo_id, "ingesting", "fetching_commits")
+    
+    # Kick off background task
+    background_tasks.add_task(
+        run_ingestion_pipeline,
+        owner,
+        repo,
+        repo_id,
+        repo_name,
+        description,
+        language
+    )
+    
+    return {"repoId": repo_id, "status": "ingesting"}
+
+@app.get("/repos/{repoId:path}/ingest-status")
+def get_repo_ingest_status(repoId: str):
+    return read_ingest_status(repoId)
+
+@app.get("/repos/{repoId:path}/status")
+def get_repo_status(repoId: str):
+    # To satisfy old code or components that still poll /status:
+    status_info = read_ingest_status(repoId)
+    progress_map = {
+        "fetching_commits": "Fetching commits from GitHub...",
+        "fetching_issues": "Fetching issues and PRs from GitHub...",
+        "extracting_rationale": "Extracting rationale sentences...",
+        "building_graph": "Indexing into Neo4j...",
+        "embedding": "Indexing into Qdrant...",
+        "done": "Complete"
+    }
+    return {
+        "status": status_info["status"],
+        "progress": progress_map.get(status_info["step"], "Indexing..."),
+        "error": status_info.get("error")
+    }
 
 if __name__ == "__main__":
     import uvicorn

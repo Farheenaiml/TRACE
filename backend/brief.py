@@ -124,51 +124,9 @@ def generate_weekly_brief(repo_id: str) -> dict:
     )
 
     # --- 6. LLM calls: Groq -> Ollama -> deterministic fallback ---
-    summary_text: Optional[str] = None
-
-    if GROQ_API_KEY:
-        try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt_user},
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.3,
-                },
-                timeout=15,
-            )
-            res.raise_for_status()
-            content = json.loads(res.json()["choices"][0]["message"]["content"])
-            summary_text = content.get("summary_text")
-        except Exception as e:
-            print(f"Groq brief generation failed, trying Ollama: {e}")
-
-    if summary_text is None:
-        try:
-            res = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": "llama3.2",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt_user},
-                    ],
-                    "format": "json",
-                    "stream": False,
-                    "options": {"temperature": 0.3},
-                },
-                timeout=20,
-            )
-            res.raise_for_status()
-            content = json.loads(res.json()["message"]["content"])
-            summary_text = content.get("summary_text")
-        except Exception as e:
-            print(f"Ollama brief generation failed or unavailable: {e}")
+    from llm import call_llm_json
+    res_dict = call_llm_json(system_prompt, prompt_user, temperature=0.3)
+    summary_text = res_dict.get("summary_text") if res_dict else None
 
     # Deterministic fallback
     if not summary_text:
