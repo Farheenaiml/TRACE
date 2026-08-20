@@ -32,12 +32,12 @@ def _load_json(path: Path) -> Optional[list | dict]:
 
 
 def generate_weekly_brief(repo_id: str) -> dict:
-    repo_slug = repo_id.split("/")[-1]
     raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
+    from repo_storage import data_path
     generated_at = datetime.now(timezone.utc).isoformat()
 
     # --- 1. Health history: this week vs last week ---
-    history_path = raw_dir / f"{repo_slug}_health_history.json"
+    history_path = data_path(repo_id, "health_history.json")
     history = _load_json(history_path) or []
     if not isinstance(history, list):
         history = []
@@ -63,9 +63,9 @@ def generate_weekly_brief(repo_id: str) -> dict:
     open_prev = last_week_snap.get("open_issue_count", "N/A")
 
     # --- 2. Agent scan results: decisions by type ---
-    results_path = raw_dir / f"{repo_slug}_agent_results.json"
+    results_path = data_path(repo_id, "agent_results.json")
     if not results_path.exists():
-        results_path = raw_dir / f"{repo_slug}_issues_agent_results.json"
+        results_path = data_path(repo_id, "issues_agent_results.json")
 
     agent_data = _load_json(results_path)
     results_list: list = []
@@ -80,7 +80,7 @@ def generate_weekly_brief(repo_id: str) -> dict:
         decision_counts[d] = decision_counts.get(d, 0) + 1
 
     # --- 3. Top 3 most-discussed open issues ---
-    issues_path = raw_dir / f"{repo_slug}_issues.json"
+    issues_path = data_path(repo_id, "issues.json")
     issues_raw = _load_json(issues_path) or []
     if not isinstance(issues_raw, list):
         issues_raw = []

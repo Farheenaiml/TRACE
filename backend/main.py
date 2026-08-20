@@ -269,6 +269,7 @@ def github_repo_response(repo: dict) -> dict:
         "description": repo.get("description") or "No description provided.",
         "language": repo.get("language") or "Unknown",
         "decisions": 0,
+        "commit_count": 0,
     }
 
 def run_repo_scan(repo_slug: str, repo_id_label: str, issues_list: list) -> dict:
@@ -470,6 +471,7 @@ class RepoResponse(BaseModel):
     description: str
     language: str
     decisions: int
+    commit_count: int = 0
 
 class FeedbackRequest(BaseModel):
     repoId: str
@@ -668,7 +670,8 @@ def list_repositories():
                     MATCH (r:Repository)
                     OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
                     OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
-                    RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
+                          RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language,
+                              count(DISTINCT c) AS commit_count, count(rat) AS decisions
                     """
                 )
                 for record in result:
@@ -677,7 +680,8 @@ def list_repositories():
                         "name": record["name"],
                         "description": record["description"] or "No description.",
                         "language": record["language"] or "Other",
-                        "decisions": record["decisions"] or 0
+                        "decisions": record["decisions"] or 0,
+                        "commit_count": record["commit_count"] or 0
                     })
         except Exception as e:
             print(f"Error querying Neo4j for repos: {e}")
@@ -856,11 +860,6 @@ def get_repository_graph_summary(repoId: str):
 
 @app.get("/repos/{repo_id:path}", response_model=RepoResponse)
 def get_repository(repo_id: str):
-    if GITHUB_TOKEN and repo_id.count("/") == 1:
-        repo = github_get(f"/repos/{repo_id}")
-        if repo:
-            return github_repo_response(repo)
-
     driver = get_neo4j_driver()
     if driver is not None:
         try:
@@ -870,7 +869,8 @@ def get_repository(repo_id: str):
                     MATCH (r:Repository {id: $repo_id})
                     OPTIONAL MATCH (c:Commit)-[:BELONGS_TO]->(r)
                     OPTIONAL MATCH (c)-[:HAS_RATIONALE]->(rat:Rationale)
-                    RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language, count(rat) AS decisions
+                          RETURN r.id AS id, r.name AS name, r.description AS description, r.language AS language,
+                              count(DISTINCT c) AS commit_count, count(rat) AS decisions
                     """,
                     repo_id=repo_id
                 )
@@ -881,12 +881,18 @@ def get_repository(repo_id: str):
                         "name": record["name"],
                         "description": record["description"],
                         "language": record["language"],
-                        "decisions": record["decisions"]
+                        "decisions": record["decisions"],
+                        "commit_count": record["commit_count"]
                     }
         except Exception as e:
             print(f"Error getting repo {repo_id}: {e}")
         finally:
             driver.close()
+
+    if GITHUB_TOKEN and repo_id.count("/") == 1:
+        repo = github_get(f"/repos/{repo_id}")
+        if repo:
+            return github_repo_response(repo)
 
     mock_r = next((r for r in MOCK_REPOS if r["id"] == repo_id), None)
     if mock_r:
@@ -895,20 +901,20 @@ def get_repository(repo_id: str):
     raise HTTPException(status_code=404, detail="Repository not found")
 
 def normalize_repo_id(input_str: str) -> str:
-    input_str = input_str.strip()
-    input_str = input_str.rstrip("/")
-    if "github.com/" in input_str:
-        parts = input_str.split("github.com/")[-1].split("/")
-        if len(parts) >= 2:
-            return f"{parts[0]}/{parts[1]}"
-    if "git@github.com:" in input_str:
-        parts = input_str.split("git@github.com:")[-1].replace(".git", "").split("/")
-        if len(parts) >= 2:
-            return f"{parts[0]}/{parts[1]}"
-    if "/" in input_str:
-        parts = input_str.split("/")
-        return f"{parts[0]}/{parts[1]}"
-    return input_str
+    from urllib.parse import urlparse
+
+    value = input_str.strip()
+    if value.startswith("git@github.com:"):
+        value = value.split("git@github.com:", 1)[1]
+    elif "github.com" in value:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        value = parsed.path
+
+    value = value.strip().strip("/").removesuffix(".git")
+    parts = [part for part in value.split("/") if part]
+    if len(parts) < 2:
+        return value
+    return f"{parts[0]}/{parts[1]}"
 
 def get_node_label_local(source_type: str) -> str:
     st = (source_type or "").lower()
@@ -1783,9 +1789,14 @@ def perform_ingestion_background(
         issues = norm_res["issues"]
         cross_references = norm_res["cross_references"]
 
+        from repo_storage import repository_key
         raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
-        (raw_dir / f"{repo_name}_issues.json").write_text(
+        storage_key = repository_key(repo_id)
+        (raw_dir / f"{storage_key}_commits.json").write_text(
+            json.dumps(commits, indent=2), encoding="utf-8"
+        )
+        (raw_dir / f"{storage_key}_issues.json").write_text(
             json.dumps(issues, indent=2), encoding="utf-8"
         )
 
@@ -1968,7 +1979,10 @@ def ingest_repository(req: IngestRequest):
 
     # Check if this repo has already been ingested
     is_empty = check_db_empty_for_repo(repo_id)
-    if not is_empty:
+    from repo_storage import data_path, repository_key
+    issues_path = data_path(repo_id, "issues.json")
+    commits_path = data_path(repo_id, "commits.json")
+    if not is_empty and issues_path.exists() and commits_path.exists():
         # Get decision count from Neo4j DB
         decisions_count = 0
         driver = get_neo4j_driver()
@@ -2345,12 +2359,12 @@ def recall_issue(req: RecallRequest):
 
 @app.get("/agent/status")
 def agent_status(repoId: str):
-    repo_slug = repoId.split('/')[-1]
     raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
-    results_path = raw_dir / f"{repo_slug}_agent_results.json"
+    from repo_storage import data_path
+    results_path = data_path(repoId, "agent_results.json")
     
     if not results_path.exists():
-        alt_path = raw_dir / f"{repo_slug}_issues_agent_results.json"
+        alt_path = data_path(repoId, "issues_agent_results.json")
         if alt_path.exists():
             results_path = alt_path
         else:
@@ -2376,14 +2390,14 @@ def agent_status(repoId: str):
 
 @app.post("/agent/scan")
 def agent_scan(repoId: str):
-    repo_slug = repoId.split('/')[-1]
     raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
-    issues_path = raw_dir / f"{repo_slug}_issues.json"
+    from repo_storage import data_path, repository_key
+    issues_path = data_path(repoId, "issues.json")
     if not issues_path.exists():
         raise HTTPException(status_code=404, detail=f"No ingested issues found for {repoId}. Run ingest.py --issues first.")
     issues = json.loads(issues_path.read_text(encoding="utf-8"))
     issues = [i for i in issues if i.get("type") == "issue"]
-    data = run_repo_scan(repo_slug, repoId, issues)
+    data = run_repo_scan(repository_key(repoId), repoId, issues)
     return data
 
 
@@ -2461,32 +2475,7 @@ def agent_comment(req: CommentRequest):
 @app.get("/health")
 def get_health(repoId: str):
     from health import compute_health
-    
-    repo_slug = repoId.split('/')[-1]
-    raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
-    issues_path = raw_dir / f"{repo_slug}_issues.json"
-
-    is_mock = any(repoId == r["id"] for r in MOCK_REPOS)
-    
-    if not issues_path.exists() or (is_mock and check_db_empty_for_repo(repoId)):
-        return {
-            "repoId": repoId,
-            "open_issue_count": 14,
-            "backlog_growth_rate": 5.2,
-            "duplicate_rate": 18.5,
-            "active_contributor_count": 8,
-            "security_flag_count": 2,
-            "avg_response_time_hours": 12.4,
-            "response_time_label": "Time to last activity (proxy for maintainer response time)",
-            "history": [
-                {"timestamp": "2026-08-01T00:00:00Z", "open_issue_count": 10},
-                {"timestamp": "2026-08-08T00:00:00Z", "open_issue_count": 12},
-                {"timestamp": "2026-08-15T00:00:00Z", "open_issue_count": 13},
-                {"timestamp": "2026-08-20T00:00:00Z", "open_issue_count": 14}
-            ]
-        }
-
-    return compute_health(repoId)
+    return compute_health(normalize_repo_id(repoId))
 
 
 @app.get("/health/investigation")

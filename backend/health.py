@@ -33,19 +33,20 @@ def parse_iso_date(dt_str: str) -> datetime:
 
 
 def compute_health(repo_id: str) -> dict:
-    repo_slug = repo_id.split('/')[-1]
     raw_dir = Path(__file__).resolve().parent.parent / "data" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    from repo_storage import data_path
 
-    issues_path = raw_dir / f"{repo_slug}_issues.json"
+    issues_path = data_path(repo_id, "issues.json")
+    commits_path = data_path(repo_id, "commits.json")
     
-    results_path = raw_dir / f"{repo_slug}_agent_results.json"
+    results_path = data_path(repo_id, "agent_results.json")
     if not results_path.exists():
-        alt_path = raw_dir / f"{repo_slug}_issues_agent_results.json"
+        alt_path = data_path(repo_id, "issues_agent_results.json")
         if alt_path.exists():
             results_path = alt_path
 
-    history_path = raw_dir / f"{repo_slug}_health_history.json"
+    history_path = data_path(repo_id, "health_history.json")
 
     if not issues_path.exists():
         return {
@@ -86,6 +87,13 @@ def compute_health(repo_id: str) -> dict:
 
     issues_raw = json.loads(issues_path.read_text(encoding="utf-8"))
     issues = [i for i in issues_raw if isinstance(i, dict)]
+    commits = []
+    if commits_path.exists():
+        try:
+            commits_raw = json.loads(commits_path.read_text(encoding="utf-8"))
+            commits = [c for c in commits_raw if isinstance(c, dict)]
+        except Exception:
+            commits = []
 
     open_issues = [i for i in issues if i.get("state") == "open"]
     open_issue_count = len(open_issues)
@@ -106,9 +114,9 @@ def compute_health(repo_id: str) -> dict:
         if time_diffs_hours else 0.0
     )
 
-    # 2. Active contributors in last 30 days based on issue dates
+    # 2. Active contributors in last 30 days based on issues and commits
     now = datetime.now(timezone.utc)
-    all_dates = [parse_iso_date(i.get("date")) for i in issues]
+    all_dates = [parse_iso_date(i.get("date")) for i in issues] + [parse_iso_date(c.get("date")) for c in commits]
     latest_ref_date = max(all_dates) if all_dates else now
     thirty_days_ago = latest_ref_date - timedelta(days=30)
 
@@ -118,6 +126,12 @@ def compute_health(repo_id: str) -> dict:
         if i.get("author") and i.get("author") != "unknown"
         and parse_iso_date(i.get("date")) >= thirty_days_ago
     }
+    active_authors.update(
+        c.get("author")
+        for c in commits
+        if c.get("author") and c.get("author") != "unknown"
+        and parse_iso_date(c.get("date")) >= thirty_days_ago
+    )
     active_contributor_count = len(active_authors)
 
     # 3. Agent results: duplicate rate & security flag count

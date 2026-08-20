@@ -1,53 +1,50 @@
 # TRACE
 
 AI-powered decision intelligence platform that extracts, stores, and retrieves
-the rationale behind software development decisions, and answers questions
-about them through a conversational, evidence-grounded interface.
+the rationale behind software development decisions. The current repo is the
+**backend** (ingestion pipeline + FastAPI). A previous frontend in this tree
+was incomplete and has been removed.
 
 ## Structure
 
 ```
 TRACE/
-├── frontend/                 React app (built with TanStack Start + Tailwind)
-│   ├── src/components/trace/      TRACE-specific UI components
-│   ├── src/lib/mock-api.ts        Placeholder data layer — swap for real API calls later
-│   └── src/routes/                App pages (repo picker, dashboard, recall view)
-│
-├── backend/
-│   ├── ingest.py              Pulls commits from a GitHub repo -> normalized JSON
-│   ├── extractor.py           Reads that JSON, flags rationale sentences
-│   ├── graph_store.py         Loads extracted rationale into Neo4j + Qdrant
-│   └── requirements.txt
-│
-├── data/raw/                  Ingested + extracted JSON lands here (gitignored)
-├── docs/                      Architecture notes, schema docs
-└── .env.example                Copy to .env and fill in your own values
+├── backend/                   FastAPI API + ingestion/agent pipeline
+│   ├── main.py                REST API (CORS enabled for a future frontend)
+│   ├── ingest.py              GitHub commits / issues / PRs → data/raw JSON
+│   ├── extractor.py           Flag rationale sentences in ingested records
+│   ├── graph_store.py         Load extracted rationale into Neo4j + vectors
+│   ├── agent.py               RepoGuardian triage loop (duplicates, escalate)
+│   ├── orchestrator.py        Background monitor runs
+│   ├── langgraph_orchestrator.py  Multi-step investigation graph
+│   ├── health.py              Backlog / contributor / forecast metrics
+│   ├── brief.py               Weekly maintainer brief
+│   └── intelligence_pipeline.py  Text cleanup and cross-reference resolution
+├── data/raw/                  Ingested + extracted JSON (gitignored)
+└── .env.example               Copy to .env and fill in your own values
 ```
 
 ## Setup
 
-**Backend**
 ```
 cd backend
 pip install -r requirements.txt
 cp ../.env.example ../.env   # then fill in GITHUB_TOKEN, NEO4J_PASSWORD, etc.
 ```
 
-**Frontend**
+Start the API:
+
 ```
-cd frontend
-npm install
-npm run dev
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-## Current pipeline (working, run in this order)
+## Pipeline
 
 ```
 python backend/ingest.py <owner>/<repo> --limit 20
+python backend/ingest.py <owner>/<repo> --issues --limit 20
 python backend/extractor.py data/raw/<repo>_commits.json
-python backend/graph_store.py data/raw/<repo>_commits_extracted.json   # needs Neo4j + Qdrant running via Docker
+python backend/graph_store.py data/raw/<repo>_commits_extracted.json
 ```
 
-The frontend currently runs entirely on the placeholder data in
-`frontend/src/lib/mock-api.ts`. It is not yet connected to the backend above —
-that connection is the next major piece of work (see below).
+Graph indexing needs Neo4j (and optionally Chroma) running locally.
