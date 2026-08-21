@@ -1,111 +1,189 @@
-# TRACE — AI-Powered Decision Intelligence Engine
+# TRACE
 
-TRACE is an AI-powered decision intelligence platform that automatically extracts, indexes, and retrieves the rationale behind software development decisions. It parses commits, pull requests, issues, discussions, code structures, and wikis to answer engineering questions through a conversational, evidence-grounded interface.
+TRACE is a repository intelligence platform for maintainers. It ingests a GitHub repository, extracts development decisions from commits, pull requests, issues, discussions, documentation, and source structure, then presents the results through a live web console.
 
----
+## What It Provides
 
-## System Architecture
+- Repository ingestion with visible progress stages
+- Commit, issue, pull request, discussion, wiki, and source-structure indexing
+- Rationale extraction and Neo4j relationship storage
+- Chroma semantic search with Neo4j keyword fallback
+- RepoGuardian agent investigations for duplicates, missing information, importance, security signals, and escalation
+- Maintainer Inbox and Security Watch views backed by persisted agent results
+- Repository health metrics, explainable risk reasons, history, and backlog forecasting
+- Weekly maintainer briefs
+- Repository questions answered from RAG and the Neo4j graph with citations
+- Repository switching for any GitHub repository
 
+## Architecture
+
+```text
+GitHub repository
+        |
+        v
+FastAPI ingestion service
+  |       |        |
+  v       v        v
+ GitHub  AST      PyDriller
+  |       |        |
+  +-------+--------+
+          |
+          v
+  Rationale extraction
+       |          |
+       v          v
+    Neo4j       Chroma
+       |          |
+       +----+-----+
+            v
+     RepoGuardian agents
+            |
+            v
+      FastAPI REST API
+            |
+            v
+  TanStack Start maintainer console
 ```
-TRACE/
-├── frontend/                     React web application (TanStack Start + Vite)
-│   ├── src/components/trace/     Core UI components (Answer panel, confidence badges)
-│   ├── src/lib/mock-api.ts       Graceful-degradation client (tries real API first, falls back to offline mock data)
-│   └── src/routes/               Pages & routing (index, connect-repo, Ask dashboard, Recall, Guardian, Health)
-│
-├── backend/                      REST API & agentic reasoning pipeline (FastAPI)
-│   ├── main.py                   FastAPI gateway, async job scheduler, & search router
-│   ├── llm.py                    Consolidated Groq -> Ollama -> local fallback LLM client
-│   ├── ingest.py                 GitHub API downloader (pulls commits, PRs, issues, wiki, docs, tree)
-│   ├── extractor.py              NLP parser to extract architectural rationale sentences
-│   ├── graph_store.py            Neo4j Graph Database + Qdrant Vector database connectors
-│   ├── agent.py                  RepoGuardian triage agent (multi-step duplicate check & scoring loop)
-│   ├── health.py                 Health metrics engine & OLS trend forecaster
-│   └── brief.py                  Weekly digest generator for maintainers
-│
-└── data/raw/                     Asynchronously ingested raw datasets and status files (Gitignored)
-```
 
----
+## Requirements
 
-## Infrastructure Setup
+- Python 3.11 or newer
+- Node.js 18 or newer
+- Git
+- A GitHub token for private repositories and higher API limits
+- Neo4j for graph storage
+- Optional Groq or Ollama configuration for LLM-generated summaries
 
-To run TRACE end-to-end, start the local Neo4j graph database and Qdrant vector database via Docker:
-
-```bash
-# Start Neo4j
-docker run -d --name trace-neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/your_password neo4j
-
-# Start Qdrant
-docker run -d --name trace-qdrant -p 6333:6333 qdrant/qdrant
-```
-
----
+The embedding model is loaded locally by `sentence-transformers`. Chroma uses the persistent database under `data/chroma_db` when configured for local storage.
 
 ## Configuration
 
-Copy `.env.example` to `.env` in the repository root and fill in your values:
+Create a root `.env` file. Start from `.env.example` when available:
 
 ```ini
+GITHUB_TOKEN=your_github_token
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_password
-QDRANT_URL=http://localhost:6333
+NEO4J_PASSWORD=your_neo4j_password
+CHROMA_URL=http://localhost:8000
 OLLAMA_URL=http://localhost:11434
-GROQ_API_KEY=gsk_...
-GITHUB_TOKEN=ghp_...
+GROQ_API_KEY=your_groq_key
 SCAN_INTERVAL_MINUTES=15
 ```
 
----
+`GITHUB_TOKEN` is required for live GitHub ingestion. Groq and Ollama are optional; the backend has deterministic fallbacks for summaries and answers.
 
-## Running the Services
+## Start Infrastructure
 
-### 1. Backend REST API
-Installs requirements and starts the FastAPI server on port `8000`:
-```bash
-cd backend
-pip install -r requirements.txt
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+Start Neo4j if it is not already running:
+
+```powershell
+docker run -d --name trace-neo4j `
+  -p 7474:7474 -p 7687:7687 `
+  -e NEO4J_AUTH=neo4j/your_neo4j_password neo4j
 ```
 
-### 2. Frontend Development Server
-Installs dependencies and runs Vite development server:
-```bash
-cd frontend
+TRACE can use its persistent local Chroma database in `data/chroma_db`. Do not run a separate Chroma HTTP service on port `8000`, because the FastAPI backend uses that port.
+
+## Run Locally
+
+Open two terminals.
+
+### Backend
+
+From the `backend` directory:
+
+```powershell
+cd C:\Users\zaree\Downloads\TRACE\TRACE\backend
+..\.venv\Scripts\Activate.ps1
+uvicorn main:app --reload --port 8000
+```
+
+Alternatively, from the project root:
+
+```powershell
+cd C:\Users\zaree\Downloads\TRACE\TRACE
+.\.venv\Scripts\Activate.ps1
+uvicorn backend.main:app --reload --port 8000
+```
+
+### Frontend
+
+```powershell
+cd C:\Users\zaree\Downloads\TRACE\TRACE\frontend
 npm install
 npm run dev
 ```
 
----
+Open `http://localhost:5173`.
 
-## Ingestion & Triage Pipeline
+The Vite development proxy forwards `/api/*` requests to `http://127.0.0.1:8000`.
 
-TRACE features an asynchronous two-step ingestion pipeline triggered from the frontend UI or directly via the API:
+## Use the Application
 
-### Step 1: Request Ingestion (`POST /repos/add`)
-Send a POST request with the GitHub repository URL to initiate ingestion:
-```bash
-curl -X POST http://localhost:8000/repos/add \
-  -H "Content-Type: application/json" \
-  -d '{"repoUrl": "https://github.com/owner/repo"}'
+1. Enter a GitHub URL or an `owner/repository` value, for example `psf/requests`.
+2. Watch the ingestion pipeline progress through GitHub fetch, cloning, AST parsing, commit mining, issue normalization, rationale extraction, Neo4j indexing, and monitoring.
+3. Review Dashboard and Repository Intelligence for extracted counts and recent activity.
+4. Review Investigations, Maintainer Inbox, Security Watch, Agent Activity, Health, Forecast, and Weekly Brief.
+5. Use Ask RepoGuardian to query indexed decisions using semantic retrieval and graph context.
+
+## Important API Endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /repos/ingest` | Start ingestion for a GitHub repository |
+| `GET /repos/ingest/status/{repo_id}` | Read ingestion stage and progress counts |
+| `GET /repos/{repo_id}` | Read repository metadata |
+| `GET /repos/activity?repoId=owner/repo` | Read commit, issue, PR, contributor, and collaborator activity |
+| `GET /repos/overview?repoId=owner/repo` | Read Neo4j entity counts and repository activity |
+| `GET /repos/investigations?repoId=owner/repo` | Read agent investigations and monitoring steps |
+| `GET /repos/inbox?repoId=owner/repo` | Read escalated maintainer items |
+| `GET /repos/monitor/status?repoId=owner/repo` | Read the persisted monitoring run |
+| `GET /health?repoId=owner/repo` | Read health metrics and explainable reasons |
+| `GET /health/investigation?repoId=owner/repo` | Read health trend findings |
+| `GET /brief?repoId=owner/repo` | Generate the current weekly brief |
+| `POST /repos/query` | Ask a grounded repository question |
+| `POST /recall` | Find similar indexed issues and decisions |
+
+FastAPI docs are available at `http://localhost:8000/docs` while the backend is running.
+
+## Data Sources and Metric Meaning
+
+TRACE keeps source distinctions visible:
+
+- GitHub totals are live GitHub API totals when available.
+- Indexed counts describe records currently stored in Neo4j or local repository files.
+- Agent metrics describe the latest completed RepoGuardian scan.
+- The health activity-window metric is calculated from issue creation and last-update timestamps; it is not an exact maintainer first-response time.
+- Forecasts use persisted health snapshots and are marked with their confidence and history status.
+
+## Validation
+
+Backend syntax check:
+
+```powershell
+python -m py_compile backend\main.py backend\health.py backend\orchestrator.py backend\langgraph_orchestrator.py
 ```
-This performs a validation check against the GitHub API, writes a starting state, and schedules a background worker.
 
-### Step 2: Asynchronous Job Processing & Polling
-The background task executes the full ingestion pipeline:
-1. **GitHub Ingestion (`ingest.py`)**: Fetches repository metadata, commits, PRs, issues, wiki documentation, and source code trees.
-2. **Rationale Extraction (`extractor.py`)**: Runs NLP algorithms to isolate and extract rationale sentences.
-3. **Graph & Vector Loaders (`graph_store.py`)**: Builds entity relations in Neo4j and calculates/saves vector embeddings in Qdrant.
-4. **RepoGuardian Agent Triage (`agent.py`)**: Automatically scans issues for duplicate detection, escalation scoring, and priority alerts.
-5. **Mark Ready**: Writes a completion status file when done.
+Frontend production build:
 
-During processing, the frontend polls the status endpoint to display live progress:
-```bash
-# Get raw status
-curl http://localhost:8000/repos/owner/repo/ingest-status
-
-# Get progress strings
-curl http://localhost:8000/repos/owner/repo/status
+```powershell
+cd frontend
+npm run build
 ```
-Once complete, the repository becomes active on the dashboard.
+
+Backend tests, when dependencies and services are available:
+
+```powershell
+pytest backend
+```
+
+## Repository Layout
+
+```text
+backend/       FastAPI API, ingestion, extraction, graph, health, and agents
+frontend/      TanStack Start maintainer console
+data/raw/      Persisted repository datasets and agent results
+data/chroma_db Persistent local Chroma data
+docs/          Project documentation
+```
