@@ -7,13 +7,13 @@ import { recallIssue, type RecallMatch } from "@/lib/mock-api";
 export const Route = createFileRoute("/repo/$repoId/recall")({
   head: () => ({
     meta: [
-      { title: "Issue recall — TRACE" },
+      { title: "Issue Recall — TRACE" },
       {
         name: "description",
         content:
           "Paste a new issue and surface similar past issues and decisions before you start work.",
       },
-      { property: "og:title", content: "Issue recall — TRACE" },
+      { property: "og:title", content: "Issue Recall — TRACE" },
       {
         property: "og:description",
         content: "Find past issues and decisions similar to a new report.",
@@ -36,6 +36,7 @@ function similarityTone(score: number) {
 
 function RecallView() {
   const { repoId } = Route.useParams();
+  const decodedRepoId = decodeURIComponent(repoId);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [loading, setLoading] = useState(false);
@@ -46,7 +47,7 @@ function RecallView() {
     if (!title.trim() || loading) return;
     setLoading(true);
     setResults(null);
-    setResults(await recallIssue(repoId, title, body));
+    setResults(await recallIssue(decodedRepoId, title, body));
     setLoading(false);
   }
 
@@ -55,7 +56,7 @@ function RecallView() {
       <section className="surface p-5 sm:p-6">
         <h1 className="text-lg font-semibold text-foreground">Issue recall</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Paste a new issue and TRACE surfaces past issues and decisions that overlap with it.
+          Paste a new issue and RepoMind surfaces past issues and decisions that overlap with it.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-5 flex flex-col gap-3">
@@ -96,12 +97,13 @@ function RecallView() {
       )}
 
       {!loading && results === null && (
-        <div className="surface flex flex-col items-center px-6 py-12 text-center">
-          <div className="flex size-11 items-center justify-center rounded-full bg-accent text-accent-foreground">
+        <div className="surface flex flex-col items-center px-6 py-14 text-center">
+          <div className="flex size-11 items-center justify-center rounded-full bg-accent text-accent-foreground mb-4">
             <Inbox className="size-5" aria-hidden />
           </div>
-          <p className="mt-4 text-sm text-muted-foreground">
-            Matches will appear here once you describe the issue.
+          <h2 className="text-base font-semibold text-foreground">No matches loaded yet</h2>
+          <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+            Describe the issue above and click "Find similar" to scan the repository indexing pipeline for candidate overlaps.
           </p>
         </div>
       )}
